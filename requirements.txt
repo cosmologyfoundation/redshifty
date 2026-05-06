@@ -1,0 +1,16 @@
+# Core dependencies
+torch>=2.0
+numpy
+matplotlib
+tqdm
+jaxtyping
+astropy
+h5py
+scipy
+wandb
+
+# Development dependencies
+pytest>=7.0
+black
+ruff
+mypy
