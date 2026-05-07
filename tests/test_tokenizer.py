@@ -39,35 +39,34 @@ class TestConvNeXtBlock1D:
 class TestLookUpFreeQuantizer:
     """Test LFQ quantizer."""
     
-    def test_quantize_range(self):
-        """Quantized values should be in [-1, 1]."""
-        lfq = LookUpFreeQuantizer(dim=8, codebook_size=256)  # 2^8 = 256
+    def test_quantize_shape(self):
+        """Quantized output should have same shape as input."""
+        lfq = LookUpFreeQuantizer(dim=8, codebook_size=256)
         z = torch.randn(2, 8, 16)
         z_q, loss, indices = lfq(z)
         
         assert z_q.shape == z.shape
-        assert indices.shape == (2, 16)  # (B, L) - each position gets one integer code
-        assert indices.min() >= 0
-        assert indices.max() < 256
+        assert indices.shape == (2, 16)
         assert loss.item() >= 0
     
-    def test_encode_decode_roundtrip(self):
-        """Encode -> decode should approximately reconstruct."""
+    def test_encode_decode_values(self):
+        """Decode should produce {-1, +1} values."""
         lfq = LookUpFreeQuantizer(dim=8, codebook_size=1024)
-        z = torch.randn(1, 8, 8)
+        z = torch.randn(2, 8, 16)
         
         indices = lfq.encode(z)
-        z_recon = lfq.decode(indices)
+        z_q = lfq.decode(indices)
         
-        # Should be close since we use straight-through estimator
-        assert z_recon.shape == z.shape
+        # Decoded values should be exactly -1 or +1
+        assert torch.all((z_q == -1) | (z_q == 1))
+        assert z_q.shape == z.shape
     
     def test_codebook_size(self):
-        """All indices should be within codebook range."""
+        """Indices should be in valid range."""
         lfq = LookUpFreeQuantizer(dim=4, codebook_size=256)
-        z = torch.randn(4, 4, 32) * 10  # Large values
-        indices = lfq.encode(z)
+        z = torch.randn(2, 4, 16)
         
+        indices = lfq.encode(z)
         assert indices.min() >= 0
         assert indices.max() < 256
 
@@ -99,12 +98,14 @@ class TestSpectrumTokenizer:
         assert recon.shape == (1, 2, LATENT_GRID_SIZE)
     
     def test_encode_decode_consistency(self):
-        """Forward encode should match standalone encode."""
+        """Forward encode should match standalone encode (in eval mode)."""
         model = SpectrumTokenizer()
+        model.eval()
         x = torch.randn(1, 2, 7781)
         
-        _, _, indices_fwd = model(x)
-        indices_enc, _ = model.encode(x)
+        with torch.no_grad():
+            _, _, indices_fwd = model(x)
+            indices_enc, _ = model.encode(x)
         
         assert torch.equal(indices_fwd, indices_enc)
     

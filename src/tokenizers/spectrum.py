@@ -124,71 +124,71 @@ class UpsampleBlock(nn.Module):
 
 class LookUpFreeQuantizer(nn.Module):
     """Look-up-Free Quantizer (LFQ) - binary quantization.
-    
+
     Each dimension is quantized to {-1, +1}, giving exactly 2^dim codes.
     With dim=10, codebook_size = 2^10 = 1024.
-    
-    Uses straight-through estimator with commitment loss only.
-    Temperature is fixed (not learned) for stability.
+
+    Uses straight-through estimator with commitment loss.
     """
-    
+
     def __init__(self, dim=10, codebook_size=1024, commitment_weight=0.25):
         super().__init__()
         self.dim = dim
         self.codebook_size = codebook_size
         self.commitment_weight = commitment_weight
-        
+
         self.project_in = nn.Conv1d(dim, dim, kernel_size=1)
-        
+
     def forward(self, z):
         """Quantize latents.
-        
+
         Args:
             z: (B, dim, L) continuous latent
-            
+
         Returns:
             z_q: (B, dim, L) quantized latent
             loss: quantization loss
             indices: (B, L) token indices
         """
         z = self.project_in(z)
-        
-        # Binary quantization: sign(z) → {-1, +1}
+
+        # Binary quantization: sign(z) -> {-1, +1}
         z_q = torch.sign(z)
-        
+
         # Straight-through estimator
         z_q = z + (z_q - z).detach()
-        
-        # Commitment loss only
-        loss = F.mse_loss(z, z_q.detach()) * self.commitment_weight
-        
+
+        # Commitment loss (pull z toward +/-1)
+        loss = F.mse_loss(z, torch.sign(z).detach()) * self.commitment_weight
+
         # Compute indices: binary to integer
         bits = ((z_q + 1) / 2).long()  # (B, dim, L) with values {0, 1}
         powers = torch.arange(self.dim, device=z.device).view(1, -1, 1)
         indices = (bits * (2 ** powers)).sum(dim=1)  # (B, L)
-        
+
         return z_q, loss, indices
-    
+
     def encode(self, z):
         """Encode to discrete indices."""
         z = self.project_in(z)
         z_q = torch.sign(z)
-        
+
         bits = ((z_q + 1) / 2).long()
         powers = torch.arange(self.dim, device=z.device).view(1, -1, 1)
         indices = (bits * (2 ** powers)).sum(dim=1)
         return indices
-    
+
     def decode(self, indices):
         """Decode from discrete indices."""
         # Convert integer to binary
         B, L = indices.shape
         z = torch.zeros(B, self.dim, L, device=indices.device)
-        
+
         for i in range(self.dim):
             z[:, i, :] = ((indices // (2 ** i)) % 2).float() * 2 - 1
-        
+
         return z
+
 
 
 class SpectrumTokenizer(nn.Module):
@@ -449,6 +449,7 @@ class SpectrumTokenizer(nn.Module):
         
         # Reconstruction loss (on interpolated grid, denormalized)
         recon_loss = F.mse_loss(recon, x_grid)
+        
         
         loss = {
             "total": recon_loss + quant_loss,
