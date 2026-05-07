@@ -93,8 +93,8 @@ class TestSpectrumTokenizer:
         model = SpectrumTokenizer()
         x = torch.randn(1, 2, 7781)
         
-        indices = model.encode(x)
-        recon = model.decode(indices)
+        indices, denorm = model.encode(x)
+        recon = model.decode(indices, denorm)
         
         assert recon.shape == (1, 2, LATENT_GRID_SIZE)
     
@@ -104,7 +104,7 @@ class TestSpectrumTokenizer:
         x = torch.randn(1, 2, 7781)
         
         _, _, indices_fwd = model(x)
-        indices_enc = model.encode(x)
+        indices_enc, _ = model.encode(x)
         
         assert torch.equal(indices_fwd, indices_enc)
     

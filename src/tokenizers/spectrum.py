@@ -286,10 +286,12 @@ class SpectrumTokenizer(nn.Module):
             x: (B, in_channels, L) input spectrum
             
         Returns:
-            indices: (B, n_tokens) discrete token indices
+            indices: (B, dim, n_tokens) discrete token indices
+            denorm: (B,) normalization factor for denormalization
         """
         x = self.interpolate_to_grid(x)
-        x = self.encoder_stem(x)
+        x_norm, denorm = self.normalize(x)
+        x = self.encoder_stem(x_norm)
         
         for stage in self.encoder_stages:
             for block in stage:
@@ -300,13 +302,14 @@ class SpectrumTokenizer(nn.Module):
         
         indices = self.quantizer.encode(x)
         
-        return indices
+        return indices, denorm
     
-    def decode(self, indices):
+    def decode(self, indices, denorm):
         """Decode tokens to spectrum.
         
         Args:
-            indices: (B, n_tokens) discrete token indices
+            indices: (B, dim, n_tokens) discrete token indices
+            denorm: (B,) normalization factor
             
         Returns:
             x: (B, in_channels, LATENT_GRID_SIZE) reconstructed spectrum
@@ -319,6 +322,73 @@ class SpectrumTokenizer(nn.Module):
                 x = block(x)
         
         x = self.decoder_head(x)
+        
+        # Denormalize
+        x = self.denormalize(x, denorm)
+        
+        return x
+    
+    def normalize(self, x):
+        """Normalize spectrum to zero-mean, unit-variance-like range.
+        
+        AION-style normalization:
+        1. Compute robust median flux (mean of unmasked pixels, clamped)
+        2. log10 compress the normalization factor
+        3. Normalize flux: (flux / norm - 1) * input_scaling
+        4. Normalize istd similarly
+        5. Stack and apply arcsinh for additional range compression
+        
+        Args:
+            x: (B, 2, L) where x[:,0] = flux, x[:,1] = istd
+            
+        Returns:
+            x_norm: (B, 2, L) normalized spectrum
+            norm_factor: (B,) normalization factor for denormalization
+        """
+        flux = x[:, 0:1, :]  # (B, 1, L)
+        istd = x[:, 1:2, :]  # (B, 1, L)
+        
+        # Compute robust median (mean of positive flux)
+        positive_mask = flux > 0
+        norm = (flux * positive_mask.float()).sum(dim=-1) / (positive_mask.sum(dim=-1).float() + 1.0)
+        norm = torch.clamp(norm, min=0.1)  # Avoid division by zero
+        
+        # log10 compression of normalization factor
+        norm_log = torch.log10(norm + 1.0)
+        
+        # Denormalization factor
+        denorm = torch.clamp(10 ** norm_log - 1.0, min=0.1)
+        
+        # Normalize flux and istd
+        flux_norm = (flux / denorm.unsqueeze(-1) - 1.0) * 0.2
+        istd_norm = (istd / denorm.unsqueeze(-1)) * 0.2
+        
+        # Stack and apply arcsinh for range compression
+        x_norm = torch.arcsinh(torch.cat([flux_norm, istd_norm], dim=1))
+        
+        return x_norm, denorm
+    
+    def denormalize(self, x_norm, denorm):
+        """Denormalize reconstructed spectrum.
+        
+        Args:
+            x_norm: (B, 2, L) normalized spectrum (after inverse arcsinh)
+            denorm: (B,) normalization factor
+            
+        Returns:
+            x: (B, 2, L) denormalized spectrum
+        """
+        # Inverse arcsinh
+        x = torch.sinh(x_norm)
+        
+        flux_norm = x[:, 0:1, :]
+        istd_norm = x[:, 1:2, :]
+        
+        # Denormalize
+        flux = (flux_norm / 0.2 + 1.0) * denorm.unsqueeze(-1)
+        istd = (istd_norm / 0.2) * denorm.unsqueeze(-1)
+        
+        x = torch.cat([flux, istd], dim=1)
         
         return x
     
@@ -336,8 +406,11 @@ class SpectrumTokenizer(nn.Module):
         # Interpolate to fixed grid
         x_grid = self.interpolate_to_grid(x)
         
+        # Normalize
+        x_norm, denorm = self.normalize(x_grid)
+        
         # Encode
-        h = self.encoder_stem(x_grid)
+        h = self.encoder_stem(x_norm)
         for stage in self.encoder_stages:
             for block in stage:
                 h = block(h)
@@ -354,9 +427,12 @@ class SpectrumTokenizer(nn.Module):
             for block in stage:
                 h = block(h)
         
-        recon = self.decoder_head(h)
+        recon_norm = self.decoder_head(h)
         
-        # Reconstruction loss (on interpolated grid)
+        # Denormalize
+        recon = self.denormalize(recon_norm, denorm)
+        
+        # Reconstruction loss (on interpolated grid, denormalized)
         recon_loss = F.mse_loss(recon, x_grid)
         
         loss = {
@@ -385,8 +461,8 @@ def test_tokenizer_shapes():
     print(f"Losses:        { {k: f'{v.item():.4f}' for k, v in loss.items()} }")
     
     # Encode/decode round-trip
-    indices2 = model.encode(x)
-    recon2 = model.decode(indices2)
+    indices2, denorm = model.encode(x)
+    recon2 = model.decode(indices2, denorm)
     print(f"\nEncode -> Decode shape: {recon2.shape}")
     print(f"Max reconstruction diff: {(recon - recon2).abs().max().item():.6f}")
     
