@@ -145,6 +145,18 @@ class TestSpectrumTokenizer:
         # Loss should generally decrease
         assert losses[-1] < losses[0]
     
+    def test_decoder_not_constant(self):
+        """Decoder should output non-constant values (regression test for #1)."""
+        model = SpectrumTokenizer()
+        x = torch.randn(1, 2, 8704)
+        
+        model.eval()
+        with torch.no_grad():
+            recon, _, _ = model(x)
+        
+        # Reconstruction should have variance > 0
+        assert recon.std() > 0.01, f"Decoder output is constant: std={recon.std():.6f}"
+    
     def test_parameter_count(self):
         """Model should have reasonable parameter count."""
         model = SpectrumTokenizer()
