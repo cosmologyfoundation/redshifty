@@ -65,7 +65,7 @@ Living document of findings, decisions, and experimental results.
 
 ### Next Steps
 
-1. Phase 1: Build minimal smoke-test data pipeline
+1. ~~Phase 1: Build minimal smoke-test data pipeline~~ ✅ COMPLETE
 2. Phase 2: Adapt spectrum tokenizer from AION
 3. Phase 3: Redshift scalar tokenizer
 4. Phase 4: Transformer backbone
@@ -74,5 +74,52 @@ Living document of findings, decisions, and experimental results.
 7. Phase 7: Evaluation & comparison
 8. Phase 8: NERSC full-scale training
 9. Phase 9: OOD generalization prep
+
+## 2026-05-06: Phase 1 — Minimal Smoke-Test Data Pipeline
+
+### Data Source
+- Downloaded **real DESI EDR data** from `data.desi.lbl.gov`
+- File: `coadd-sv3-bright-10016.fits` (18.5 MB) + `redrock-sv3-bright-10016.fits` (96 KB)
+- Contains **43 spectra** from SV3 "one-percent" bright targets
+- Redshift range: **[-0.0020, 1.1854]** (mix of stars and galaxies)
+- Wavelength coverage: **3600–9824 Å** (B+R+Z camera bands stitched)
+- Native pixel count after stitching: **7781 pixels** (slightly more than standard 7081 due to overlaps)
+
+### Pipeline Components Built
+1. **`src/utils/data.py`** — `DESISpectrumDataset` PyTorch Dataset
+   - Stitches B/R/Z bands via inverse-variance weighted averaging in overlap regions
+   - Returns dict of tensors: `flux`, `ivar`, `mask`, `wavelength`, `z`
+   - `collate_desi_batch()` for DataLoader batching
+
+2. **`src/utils/plotting.py`** — Visualization utilities
+   - `plot_spectrum()`: Single spectrum with error regions and masking
+   - `plot_spectrum_grid()`: Grid of multiple spectra
+   - `plot_redshift_distribution()`: Histogram with statistics
+   - `plot_reconstruction_comparison()`: Original vs reconstructed (for later phases)
+   - `plot_training_curves()`: Loss curves (for later phases)
+
+3. **`tests/test_data.py`** — pytest suite (10 tests, all passing)
+   - Band stitching with/without overlaps
+   - Real data loading, shapes, wavelength range, redshift values
+   - Batch collation
+
+4. **`scripts/visualize_spectra.py`** — Standalone visualization script
+   - Plots sample spectra grid + redshift distribution
+   - Outputs to `plots/` directory
+
+### Key Observations from Real Data
+- Spectra show clear **emission lines** (H-alpha, O-III, etc.) at various redshifts
+- One object at z ≈ −0.002 is a **star** (flat continuum, no emission lines)
+- Flux amplitudes vary by ~10× across objects — need robust normalization for tokenizer
+- B/R/Z band overlaps (~40 pixels each) require careful stitching to avoid discontinuities
+
+### Decisions Made
+- **Using real data, not synthetic** — assignment explicitly calls for real DESI data
+- **Native wavelength grid** — keeping the stitched 7781-pixel grid rather than forcing exactly 7081 pixels; the tokenizer will interpolate to its latent grid anyway
+- **Coadd files preferred** — coadds combine multiple exposures and have higher S/N than individual spectra
+
+### Next Steps
+- Phase 2: Adapt AION spectrum tokenizer (ConvNeXt-V2 + LFQ) to our data format
+- Phase 3: Redshift scalar tokenizer
 
 ---
