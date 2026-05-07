@@ -123,18 +123,25 @@ class UpsampleBlock(nn.Module):
 
 
 class LookUpFreeQuantizer(nn.Module):
-    """Look-up-Free Quantizer (LFQ) - simplified version.
+    """Look-up-Free Quantizer (LFQ) - binary quantization.
     
-    Uses straight-through estimator on continuous latents with commitment loss.
+    Each dimension is quantized to {-1, +1}, giving exactly 2^dim codes.
+    With dim=10, codebook_size = 2^10 = 1024.
+    
+    Uses straight-through estimator with commitment + entropy losses.
     """
     
-    def __init__(self, dim=10, codebook_size=1024, commitment_weight=0.25):
+    def __init__(self, dim=10, codebook_size=1024, commitment_weight=0.25, entropy_weight=0.1):
         super().__init__()
         self.dim = dim
         self.codebook_size = codebook_size
         self.commitment_weight = commitment_weight
+        self.entropy_weight = entropy_weight
         
         self.project_in = nn.Conv1d(dim, dim, kernel_size=1)
+        
+        # Temperature for controlling sharpness of sign
+        self.temperature = nn.Parameter(torch.ones(1) * 0.5)
         
     def forward(self, z):
         """Quantize latents.
@@ -149,30 +156,57 @@ class LookUpFreeQuantizer(nn.Module):
         """
         z = self.project_in(z)
         
-        # Straight-through quantization: round to nearest integer in [-1, 1]
-        z_q = torch.round(z).clamp(-1, 1)
+        # Scale by temperature to control sharpness
+        z_scaled = z / (self.temperature.abs() + 1e-8)
+        
+        # Binary quantization: sign(z) → {-1, +1}
+        z_q = torch.sign(z_scaled)
         
         # Straight-through estimator
-        z_q = z + (z_q - z).detach()
+        z_q = z_scaled + (z_q - z_scaled).detach()
         
         # Commitment loss
-        loss = F.mse_loss(z, z_q.detach()) * self.commitment_weight
+        commit_loss = F.mse_loss(z, z_q.detach()) * self.commitment_weight
         
-        # Compute indices: map [-1, 1] to [0, codebook_size-1]
-        indices = ((z_q + 1) / 2 * (self.codebook_size - 1)).long().clamp(0, self.codebook_size - 1)
+        # Entropy loss: encourage balanced code usage
+        # Compute probability of +1 for each dimension
+        p = torch.sigmoid(z_scaled)  # (B, dim, L)
+        # Binary entropy: H = -p*log(p) - (1-p)*log(1-p)
+        eps = 1e-8
+        entropy = -(p * torch.log(p + eps) + (1 - p) * torch.log(1 - p + eps))
+        entropy_loss = -entropy.mean() * self.entropy_weight  # Negative to maximize entropy
+        
+        loss = commit_loss + entropy_loss
+        
+        # Compute indices: binary to integer
+        # z_q is in {-1, 1}, map to {0, 1} then compute binary number
+        bits = ((z_q + 1) / 2).long()  # (B, dim, L) with values {0, 1}
+        # Compute binary code: sum(bit_i * 2^i) for i in [0, dim-1]
+        powers = torch.arange(self.dim, device=z.device).view(1, -1, 1)
+        indices = (bits * (2 ** powers)).sum(dim=1)  # (B, L)
         
         return z_q, loss, indices
     
     def encode(self, z):
         """Encode to discrete indices."""
         z = self.project_in(z)
-        z_q = torch.round(z).clamp(-1, 1)
-        indices = ((z_q + 1) / 2 * (self.codebook_size - 1)).long().clamp(0, self.codebook_size - 1)
+        z_scaled = z / (self.temperature.abs() + 1e-8)
+        z_q = torch.sign(z_scaled)
+        
+        bits = ((z_q + 1) / 2).long()
+        powers = torch.arange(self.dim, device=z.device).view(1, -1, 1)
+        indices = (bits * (2 ** powers)).sum(dim=1)
         return indices
     
     def decode(self, indices):
         """Decode from discrete indices."""
-        z = indices.float() / (self.codebook_size - 1) * 2 - 1
+        # Convert integer to binary
+        B, L = indices.shape
+        z = torch.zeros(B, self.dim, L, device=indices.device)
+        
+        for i in range(self.dim):
+            z[:, i, :] = ((indices // (2 ** i)) % 2).float() * 2 - 1
+        
         return z
 
 

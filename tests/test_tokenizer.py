@@ -41,14 +41,14 @@ class TestLookUpFreeQuantizer:
     
     def test_quantize_range(self):
         """Quantized values should be in [-1, 1]."""
-        lfq = LookUpFreeQuantizer(dim=8, codebook_size=1024)
+        lfq = LookUpFreeQuantizer(dim=8, codebook_size=256)  # 2^8 = 256
         z = torch.randn(2, 8, 16)
         z_q, loss, indices = lfq(z)
         
         assert z_q.shape == z.shape
-        assert indices.shape == (2, 8, 16)  # (B, dim, L)
+        assert indices.shape == (2, 16)  # (B, L) - each position gets one integer code
         assert indices.min() >= 0
-        assert indices.max() < 1024
+        assert indices.max() < 256
         assert loss.item() >= 0
     
     def test_encode_decode_roundtrip(self):
@@ -83,7 +83,7 @@ class TestSpectrumTokenizer:
         recon, loss, indices = model(x)
         
         assert recon.shape == (2, 2, LATENT_GRID_SIZE)
-        assert indices.ndim == 3  # (B, embed_dim, n_tokens)
+        assert indices.ndim == 2  # (B, n_tokens) - each position gets one integer code
         assert "total" in loss
         assert "recon" in loss
         assert "quant" in loss
