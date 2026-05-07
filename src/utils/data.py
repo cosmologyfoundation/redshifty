@@ -119,36 +119,63 @@ class DESISpectrumDataset(Dataset):
         redrock_path: Optional[Union[str, Path]] = None,
         max_spectra: Optional[int] = None,
         transform=None,
+        require_good_zwarn: bool = True,
+        require_nonzero_flux: bool = True,
     ):
         self.coadd_path = Path(coadd_path)
         self.redrock_path = Path(redrock_path) if redrock_path else None
         self.transform = transform
+        self.require_good_zwarn = require_good_zwarn
+        self.require_nonzero_flux = require_nonzero_flux
         
         # Load spectra from coadd file
         self.spectra = self._load_coadd(max_spectra)
         self.n_spectra = len(self.spectra)
         
-        print(f"Loaded {self.n_spectra} spectra from {self.coadd_path.name}")
-        print(f"  Wavelength range: [{self.spectra[0]['wavelength'].min():.1f}, "
-              f"{self.spectra[0]['wavelength'].max():.1f}] Å")
-        print(f"  Pixels per spectrum: {len(self.spectra[0]['wavelength'])}")
+        print(f"Loaded {self.n_spectra} good spectra from {self.coadd_path.name}")
+        if self.n_spectra > 0:
+            print(f"  Wavelength range: [{self.spectra[0]['wavelength'].min():.1f}, "
+                  f"{self.spectra[0]['wavelength'].max():.1f}] Å")
+            print(f"  Pixels per spectrum: {len(self.spectra[0]['wavelength'])}")
     
     def _load_coadd(self, max_spectra: Optional[int] = None) -> List[Dict]:
-        """Load and stitch spectra from coadd FITS file."""
+        """Load and stitch spectra from coadd FITS file.
+        
+        Filters out bad spectra based on ZWARN flags, fiber status, and flux.
+        """
         spectra = []
+        n_filtered_zwarn = 0
+        n_filtered_flux = 0
+        n_filtered_fiber = 0
         
         with fits.open(self.coadd_path) as hdul:
             n = hdul["B_FLUX"].data.shape[0]
-            if max_spectra is not None:
-                n = min(n, max_spectra)
             
-            # Read redshifts if available
+            # Read quality flags from coadd fibermap
+            fibermap = hdul["FIBERMAP"].data
+            fiberstatus = fibermap["COADD_FIBERSTATUS"]
+            
+            # Read redshifts and quality flags if available
             redshifts = None
+            zwarn = None
             if self.redrock_path and self.redrock_path.exists():
                 with fits.open(self.redrock_path) as rh:
-                    redshifts = rh["REDSHIFTS"].data["Z"][:n]
+                    redshifts = rh["REDSHIFTS"].data["Z"]
+                    zwarn = rh["REDSHIFTS"].data["ZWARN"]
             
             for i in range(n):
+                # Apply filters
+                
+                # Filter 1: Check fiber status (0 = good)
+                if self.require_good_zwarn and fiberstatus[i] != 0:
+                    n_filtered_fiber += 1
+                    continue
+                
+                # Filter 2: Check ZWARN (0 = good redshift)
+                if self.require_good_zwarn and zwarn is not None and zwarn[i] != 0:
+                    n_filtered_zwarn += 1
+                    continue
+                
                 # Read each band
                 b_flux = hdul["B_FLUX"].data[i]
                 b_ivar = hdul["B_IVAR"].data[i]
@@ -165,6 +192,15 @@ class DESISpectrumDataset(Dataset):
                 z_mask = hdul["Z_MASK"].data[i] != 0
                 z_wave = hdul["Z_WAVELENGTH"].data
                 
+                # Filter 3: Check for non-zero flux
+                if self.require_nonzero_flux:
+                    total_flux = (
+                        np.abs(b_flux).sum() + np.abs(r_flux).sum() + np.abs(z_flux).sum()
+                    )
+                    if total_flux == 0:
+                        n_filtered_flux += 1
+                        continue
+                
                 # Stitch bands
                 stitched = stitch_bands(
                     [b_wave, r_wave, z_wave],
@@ -180,6 +216,21 @@ class DESISpectrumDataset(Dataset):
                     stitched["z"] = 0.0
                 
                 spectra.append(stitched)
+                
+                # Stop if we've reached max_spectra
+                if max_spectra is not None and len(spectra) >= max_spectra:
+                    break
+        
+        # Report filtering stats
+        total_filtered = n_filtered_zwarn + n_filtered_flux + n_filtered_fiber
+        if total_filtered > 0:
+            print(f"  Filtered out {total_filtered} bad spectra:")
+            if n_filtered_fiber > 0:
+                print(f"    {n_filtered_fiber} bad fiber status")
+            if n_filtered_zwarn > 0:
+                print(f"    {n_filtered_zwarn} bad ZWARN")
+            if n_filtered_flux > 0:
+                print(f"    {n_filtered_flux} zero flux")
         
         return spectra
     
