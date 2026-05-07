@@ -159,6 +159,14 @@ checkpoints/
 # Wandb
 wandb/
 
+# Notebook outputs
+notebooks/*_executed.ipynb
+notebooks/*.html
+
+# Plots (generated)
+plots/*.png
+plots/*.pdf
+
 # OS files
 .DS_Store
 Thumbs.db

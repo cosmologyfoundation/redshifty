@@ -119,7 +119,69 @@ Living document of findings, decisions, and experimental results.
 - **Coadd files preferred** — coadds combine multiple exposures and have higher S/N than individual spectra
 
 ### Next Steps
-- Phase 2: Adapt AION spectrum tokenizer (ConvNeXt-V2 + LFQ) to our data format
+- ~~Phase 2: Adapt AION spectrum tokenizer (ConvNeXt-V2 + LFQ)~~ ✅ COMPLETE
 - Phase 3: Redshift scalar tokenizer
+- Phase 4: Transformer backbone
+- Phase 5: Approach A training
+- Phase 6: Approach B training
+- Phase 7: Evaluation & comparison
+- Phase 8: NERSC full-scale training
+- Phase 9: OOD generalization prep
+
+## 2026-05-07: Phase 2 — Spectrum Tokenizer
+
+### Architecture Built
+**`src/tokenizers/spectrum.py`** — ConvNeXt-V2 autoencoder + LFQ quantization
+
+**Encoder:**
+- Stem: 4×4 conv, stride 4 (8704 → 2176)
+- Stage 1: 3 ConvNeXt blocks @ 96 dim
+- Stage 2: downsample 2× + 3 blocks @ 192 dim (→ 1088)
+- Stage 3: downsample 2× + 9 blocks @ 384 dim (→ 544)
+- Stage 4: downsample 2× + 3 blocks @ 512 dim (→ 272)
+- Pre-quant: LayerNorm + 1×1 conv (512 → 10 dim)
+
+**Quantizer:**
+- Look-up-Free Quantizer (LFQ), dim=10, codebook_size=1024
+- Straight-through estimator with commitment loss (β=0.25)
+- Simplified from Yu et al. (2023)
+
+**Decoder:**
+- Mirror of encoder with ConvTranspose1d upsampling
+- Output head: transposed conv stride 4 + 1×1 conv → 2 channels
+
+**Key design choices:**
+- Input is **interpolated to fixed 8704-pixel grid** (like AION) to ensure exact token count
+- Output is also on 8704-pixel grid; user can interpolate back to original wavelength if needed
+- Total parameters: **~24M** (AION's is ~50M; ours is scaled down for smoke testing)
+
+### Tests
+- `tests/test_tokenizer.py` — 12 tests, all passing
+- ConvNeXt block preserves shape, residual connection works
+- LFQ quantizes to valid range, encode→decode roundtrip works
+- Full tokenizer: forward pass, different batch sizes, different input lengths
+- Model can overfit a single sample (loss decreases with training)
+
+### Notebook
+- `notebooks/02_tokenizer.ipynb` — Interactive training & visualization
+- Loads real DESI data, trains tokenizer for 50 epochs
+- Plots original vs reconstructed spectra with residuals
+- Computes MSE and R² reconstruction quality metrics
+- Shows token usage distribution
+
+### Comparison with AION
+| Feature | AION Tokenizer | Our Tokenizer |
+|---------|---------------|---------------|
+| Backbone | ConvNeXt-V2 | ConvNeXt-V2 ✅ |
+| Input grid | 8704 pixels | 8704 pixels ✅ |
+| Output tokens | 273 | 272 (off by 1, fixable with padding) |
+| Quantizer | LFQ (dim=10, codebook=1024) | LFQ (dim=10, codebook=1024) ✅ |
+| Parameters | ~50M | ~24M (smaller for smoke test) |
+| Normalization token | Yes (log10 median flux) | Not yet — will add in Phase 3 |
+| Training data | Millions of spectra | 25 spectra (smoke test only) |
+
+### Next Steps
+- Phase 3: Redshift scalar tokenizer (CDF → Gaussian → FSQ)
+- Phase 4: Transformer encoder-decoder backbone
 
 ---
