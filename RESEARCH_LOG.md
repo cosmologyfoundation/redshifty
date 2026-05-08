@@ -185,3 +185,105 @@ Living document of findings, decisions, and experimental results.
 - Phase 4: Transformer encoder-decoder backbone
 
 ---
+
+## 2026-05-08: Phase 8 — NERSC Scaffolding for Tokenizer Pretrain
+
+### Diagnosis: Why local results stalled
+
+After running both Approach A and B for 10 epochs on 269 spectra with the
+"fixed_split" honest random validation (seed=42), val loss bottomed out at
+3.44 (A) / 3.09 (B) and overall accuracy at ~20–24%. Redshift accuracy
+plateaued at 84.5% — that's the star-prior shortcut, not real learning.
+
+The dominant cause is **the spectrum tokenizer is still random-init**. The
+transformer is being trained against essentially random discrete codes, so
+spectrum_acc is structurally bounded near the noise floor regardless of
+model size or epoch count. This must be fixed before any further
+transformer scaling experiments.
+
+### Decision: NERSC first, tokenizer first
+
+Move to Perlmutter for compute. Pretrain the tokenizer end-to-end on real
+DR1 (not just the 4 healpix files we have locally), then re-run the
+transformer with the trained codebook frozen.
+
+### NERSC environment facts (verified)
+
+- DR1 lives at `/global/cfs/cdirs/desi/public/dr1`, world-readable to any
+  NERSC user. No `desi` unix group needed for the public tree.
+- DR1 production = **iron**. Healpix coadds at
+  `spectro/redux/iron/healpix/{survey}/{program}/{hpix_group}/{healpix}/`.
+  Surveys: sv1/sv2/sv3/main. Programs: bright/dark/backup/other.
+- Authoritative redshift catalog: `zcatalog/v1/zall-pix-iron.fits` (~21 GB);
+  per-program `zpix-{survey}-{program}.fits` is the right file for subset
+  selection without globbing.
+- NERSC project name: **`deepsrch`**. GPU jobs use the **`_g`** suffix:
+  `--account=deepsrch_g`. CPU jobs are bare `deepsrch`.
+- QOS choice: **`shared`** lets us request `--gpus=1` and pay 1/4 the
+  allocation hours vs `regular` (which forces a full 4-GPU node). Up to
+  48h wallclock. Right call for a single-GPU pretrain.
+- Filesystem: code in `$HOME`, manifests/checkpoints in `$SCRATCH`
+  (high-perf Lustre but **purged after ~8 weeks idle**), final artifacts
+  mirrored back to `$CFS` / repo `checkpoints/nersc/`.
+
+### Architecture: manifest-based streaming, not preload
+
+The local `DESISpectrumDataset` loads every spectrum at `__init__` time.
+That doesn't scale to DR1's millions of spectra. Solution:
+
+1. `nersc/build_dr1_index.py` walks the iron tree once, writes a JSONL
+   manifest of `(coadd_path, redrock_path, n_rows, survey, program,
+   healpix)` records.
+2. `nersc/dr1_dataset.py::DR1IndexedDataset` flattens the manifest to one
+   `(rec_idx, row_idx)` per spectrum. `__getitem__` opens FITS on demand
+   with a small memmap'd HDUL cache. Multi-worker DataLoader parallelizes
+   I/O.
+3. `collate_dr1_skip_none` drops rows that fail ZWARN/fiber-status/flux
+   filters at read time, so quality cuts apply naturally.
+
+### Training entry point
+
+`nersc/pretrain_tokenizer.py`:
+- Single-GPU AMP loop. AdamW + cosine schedule with warmup.
+- Reuses `SpectrumTokenizer.forward` which already returns
+  `{total, recon, quant}` losses. We backprop on `total`.
+- Periodic checkpointing to `$SCRATCH/deepsrch/checkpoints/<run>/`,
+  best/final mirrored to `--cfs-out` for `$SCRATCH`-purge survival.
+- Smoke flag: 50 steps, 200 spectra, no AMP — validates the pipeline in
+  a few minutes inside the 10-min `shared`-QOS smoke job.
+
+DDP intentionally deferred. `nersc/ddp_template.slurm` is a placeholder;
+promoting the trainer to DDP is a small, separate code change (wrap in
+DDP, swap shuffle for DistributedSampler) that should happen *after* the
+single-GPU run validates the data path.
+
+### Submission flow
+
+```
+ssh perlmutter
+cd ~/FoundationModel
+bash nersc/setup_env.sh                # one-time
+sbatch nersc/smoke_tokenizer.slurm     # 10 min, ~few hundred spectra
+sbatch nersc/pretrain_tokenizer.slurm  # 24h, ~hundreds of thousands of spectra
+```
+
+### Backlog / ideas
+
+- **Top-hat 5-pixel convolution** as preprocessing before the tokenizer
+  encoder — may smooth out per-pixel noise that the LFQ codebook is
+  currently spending capacity on. Try this once the baseline tokenizer
+  is trained, as an ablation.
+- Once `best.pt` exists from NERSC: add `--tokenizer-ckpt PATH` to
+  `scripts/train.py` so the transformer training (Approach A and B)
+  loads frozen pretrained weights instead of random init.
+- Honest val for transformer should be a held-out set of *healpix*
+  files, not random rows from the same healpix — eliminates
+  same-pointing leakage.
+
+### Next steps
+
+- Phase 8 (in flight): tokenizer pretrain on Perlmutter shared GPU.
+- Phase 9: re-run Approach A and B with frozen pretrained tokenizer at
+  `d_model=768, n_layers=6` on full DR1 (sv3 + main, bright + dark).
+- Phase 10: OOD generalization on non-DESI spectra (assignment
+  requirement).
