@@ -11,9 +11,11 @@ a fresh login to a submitted job lives in this folder.
 | `setup_env.sh` | One-time module load + pip install + scratch dirs |
 | `build_dr1_index.py` | Walks `/global/cfs/cdirs/desi/public/dr1` and writes a JSONL manifest of healpix coadds |
 | `dr1_dataset.py` | `DR1IndexedDataset` — opens FITS on demand from a manifest |
+| `dr1_tokenized_dataset.py` | Wraps `DR1IndexedDataset` with spectrum + redshift tokenizers; emits Approach A/B sequences |
 | `pretrain_tokenizer.py` | Single-GPU AMP loop; trains `SpectrumTokenizer` from `src/tokenizers/spectrum.py` |
-| `smoke_tokenizer.slurm` | 10-min shared-QOS smoke job; validates env + data path |
-| `pretrain_tokenizer.slurm` | 24h shared-QOS full pretrain |
+| `train_transformer.py` | Single-GPU AMP loop; trains `SpectrumTransformer` with a pretrained tokenizer |
+| `smoke_tokenizer.slurm` / `pretrain_tokenizer.slurm` | 10-min smoke + 24h full pretrain |
+| `smoke_transformer.slurm` / `train_transformer.slurm` | 10-min smoke + 24h full transformer training (Approach A or B) |
 | `ddp_template.slurm` | 4-GPU template for after the trainer is promoted to DDP |
 | `export_ddp_vars.sh` | SLURM env var → torch.distributed env var helper |
 
@@ -117,6 +119,36 @@ record per log step or val pass. Plot it locally with whatever you like.
 | FITS read very slow | reading from `$CFS` with many workers | reduce `--num-workers`, or stage a manifest's worth of files to `$SCRATCH` |
 | Job killed at 8 weeks | `$SCRATCH` purge ate the checkpoint | mirror to `$CFS_OUT` is what `pretrain_tokenizer.py` does — use that copy |
 | `ImportError: cannot import name 'GradScaler'` | very old torch; we use `torch.amp.GradScaler` API | upgrade to `pytorch/2.3.1` or newer module |
+
+## Stage 2: Train the transformer with a pretrained tokenizer
+
+Once `pretrain_tokenizer.slurm` (or the trial run) lands a `best.pt` you
+trust, train Approach A and Approach B against it.
+
+```bash
+# point at the tokenizer checkpoint that came out of stage 1
+TOK=$SCRATCH/deepsrch/checkpoints/<tokenizer_run>/best.pt
+
+# 10-min smoke first (validates the loader + tokenizer load path)
+TOKENIZER_CKPT=$TOK APPROACH=a sbatch nersc/smoke_transformer.slurm
+
+# full Approach A (24h, shared QOS, 1 GPU)
+TOKENIZER_CKPT=$TOK APPROACH=a sbatch nersc/train_transformer.slurm
+
+# full Approach B (independent run; same data, frozen tokenizer)
+TOKENIZER_CKPT=$TOK APPROACH=b sbatch nersc/train_transformer.slurm
+```
+
+The trainer mirrors `best.pt` and `final.pt` to
+`$REPO/checkpoints/nersc/approach_<a|b>_<jobid>/` so the result survives
+`$SCRATCH` purge and is git-track-able.
+
+Override knobs (env vars on the `sbatch` line):
+`MAX_HEALPIX`, `STEPS`, `BATCH_SIZE`, `LR`, `NUM_WORKERS`, `D_MODEL`,
+`N_LAYERS`, `N_HEADS`. See `train_transformer.slurm` for defaults.
+
+You can also load the pretrained tokenizer in the **local** trainer for
+debugging: `python scripts/train.py --approach a --tokenizer_ckpt <path>`.
 
 ## Going from smoke → real → DDP
 

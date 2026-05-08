@@ -77,7 +77,11 @@ def parse_args():
     # Smoke test
     parser.add_argument('--smoke_test', action='store_true',
                         help='Quick 3-epoch test on small data')
-    
+
+    # Pretrained tokenizer
+    parser.add_argument('--tokenizer_ckpt', type=str, default=None,
+                        help='Path to pretrained SpectrumTokenizer .pt; loads weights before tokenizing')
+
     return parser.parse_args()
 
 
@@ -243,6 +247,14 @@ def main():
     # Tokenizers
     print("\nInitializing tokenizers...")
     spectrum_tokenizer = SpectrumTokenizer().to(device)
+    if args.tokenizer_ckpt:
+        ckpt = torch.load(args.tokenizer_ckpt, map_location=device)
+        sd = ckpt.get('model', ckpt)
+        spectrum_tokenizer.load_state_dict(sd)
+        spectrum_tokenizer.eval()
+        for p in spectrum_tokenizer.parameters():
+            p.requires_grad_(False)
+        print(f"  Loaded pretrained tokenizer: {args.tokenizer_ckpt}")
     
     # Fit redshift tokenizer
     all_z = [s['z'] for s in all_spectra]
