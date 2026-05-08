@@ -93,13 +93,13 @@ def main():
     all_spectra = load_data(Path(config['data_dir']), require_good_zwarn=False)
     print(f"Loaded {len(all_spectra)} spectra")
     
-    # Train/val split (same as training: 90/10, seed=42)
-    n = len(all_spectra)
-    n_train = int(0.9 * n)
-    torch.manual_seed(42)
-    perm = torch.randperm(n)
-    train_idx = perm[:n_train].tolist()
-    val_idx = perm[n_train:].tolist()
+    # Train/val split (same as training: random 90/10, seed=42)
+    import random
+    random.seed(42)
+    indices = list(range(len(all_spectra)))
+    random.shuffle(indices)
+    n_train = int(0.9 * len(all_spectra))
+    val_idx = indices[n_train:]
     val_spectra = [all_spectra[i] for i in val_idx]
     print(f"Val: {len(val_spectra)} spectra")
     

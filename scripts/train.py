@@ -228,10 +228,16 @@ def main():
         all_spectra = all_spectra[:50]
         args.epochs = 3
     
-    # Split train/val (90/10)
+    # Split train/val (90/10) with fixed random seed for reproducibility
+    import random
+    random.seed(42)
+    indices = list(range(len(all_spectra)))
+    random.shuffle(indices)
     n_train = int(0.9 * len(all_spectra))
-    train_spectra = all_spectra[:n_train]
-    val_spectra = all_spectra[n_train:]
+    train_idx = indices[:n_train]
+    val_idx = indices[n_train:]
+    train_spectra = [all_spectra[i] for i in train_idx]
+    val_spectra = [all_spectra[i] for i in val_idx]
     print(f"Train: {len(train_spectra)}, Val: {len(val_spectra)}")
     
     # Tokenizers
