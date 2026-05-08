@@ -154,6 +154,8 @@ class DESISpectrumDataset(Dataset):
             # Read quality flags from coadd fibermap
             fibermap = hdul["FIBERMAP"].data
             fiberstatus = fibermap["COADD_FIBERSTATUS"]
+            target_ra = fibermap["TARGET_RA"]
+            target_dec = fibermap["TARGET_DEC"]
             
             # Read redshifts and quality flags if available
             redshifts = None
@@ -215,6 +217,10 @@ class DESISpectrumDataset(Dataset):
                 else:
                     stitched["z"] = 0.0
                 
+                # Add RA/DEC from fibermap
+                stitched["ra"] = float(target_ra[i])
+                stitched["dec"] = float(target_dec[i])
+                
                 spectra.append(stitched)
                 
                 # Stop if we've reached max_spectra
@@ -246,6 +252,8 @@ class DESISpectrumDataset(Dataset):
             "mask": torch.from_numpy(spec["mask"].copy()),
             "wavelength": torch.from_numpy(spec["wavelength"].copy()),
             "z": torch.tensor(spec["z"], dtype=torch.float32),
+            "ra": torch.tensor(spec["ra"], dtype=torch.float32),
+            "dec": torch.tensor(spec["dec"], dtype=torch.float32),
         }
         
         if self.transform:
@@ -271,4 +279,6 @@ def collate_desi_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.
         "mask": torch.stack([b["mask"] for b in batch]),
         "wavelength": torch.stack([b["wavelength"] for b in batch]),
         "z": torch.stack([b["z"] for b in batch]),
+        "ra": torch.stack([b["ra"] for b in batch]),
+        "dec": torch.stack([b["dec"] for b in batch]),
     }
