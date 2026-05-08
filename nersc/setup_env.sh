@@ -16,7 +16,7 @@
 set -euo pipefail
 
 # ---------- Edit this if a newer pytorch module is preferred ----------
-PYTORCH_MODULE="${PYTORCH_MODULE:-pytorch/2.3.1}"
+PYTORCH_MODULE="${PYTORCH_MODULE:-pytorch/2.8.0}"
 # ----------------------------------------------------------------------
 
 echo "[1/3] module load $PYTORCH_MODULE"

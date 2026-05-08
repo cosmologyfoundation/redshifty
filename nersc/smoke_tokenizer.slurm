@@ -24,7 +24,7 @@
 set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
 
-module load "${PYTORCH_MODULE:-pytorch/2.3.1}"
+module load "${PYTORCH_MODULE:-pytorch/2.8.0}"
 
 REPO=$(pwd)
 RUN_NAME="tok_smoke_${SLURM_JOB_ID}"
