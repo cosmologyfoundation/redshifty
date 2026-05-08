@@ -84,7 +84,7 @@ def main():
 
     # Load checkpoint
     print(f"\nLoading checkpoint: {args.checkpoint}")
-    checkpoint = torch.load(args.checkpoint, map_location=device)
+    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     
     config_path = Path(args.checkpoint).parent / 'config.json'
     if config_path.exists():

@@ -248,8 +248,8 @@ def main():
     print("\nInitializing tokenizers...")
     spectrum_tokenizer = SpectrumTokenizer().to(device)
     if args.tokenizer_ckpt:
-        ckpt = torch.load(args.tokenizer_ckpt, map_location=device)
-        sd = ckpt.get('model', ckpt)
+        ckpt = torch.load(args.tokenizer_ckpt, map_location=device, weights_only=False)
+        sd = ckpt.get('model', ckpt) if isinstance(ckpt, dict) else ckpt
         spectrum_tokenizer.load_state_dict(sd)
         spectrum_tokenizer.eval()
         for p in spectrum_tokenizer.parameters():

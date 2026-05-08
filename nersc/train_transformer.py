@@ -165,8 +165,10 @@ def main():
     # Pretrained spectrum tokenizer
     print(f"[tok] loading spectrum tokenizer {args.tokenizer_ckpt}")
     spec_tok = SpectrumTokenizer().to(device)
-    ckpt = torch.load(args.tokenizer_ckpt, map_location=device)
-    sd = ckpt.get("model", ckpt)
+    # weights_only=False because our checkpoint has optim/args dicts; the
+    # file is one we wrote ourselves, not untrusted input.
+    ckpt = torch.load(args.tokenizer_ckpt, map_location=device, weights_only=False)
+    sd = ckpt.get("model", ckpt) if isinstance(ckpt, dict) else ckpt
     spec_tok.load_state_dict(sd)
     spec_tok.eval()
     for p in spec_tok.parameters():
