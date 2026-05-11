@@ -8,6 +8,11 @@ Drop-in NERSC counterpart to scripts/train.py:
 - Trains the transformer for either Approach A (joint) or B (masked)
 - Single-GPU AMP loop; mirrors best/final checkpoints to $CFS_OUT
 
+DataLoader workers produce raw spectra only (no CUDA touches). The
+spectrum tokenizer runs on the full batch on the main process's GPU --
+this avoids the "Cannot re-initialize CUDA in forked subprocess" error
+and is much faster than per-item encode in workers.
+
 Usage (from inside a SLURM job; see train_transformer.slurm):
 
     python nersc/train_transformer.py \\
@@ -37,17 +42,23 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE))
 
-from src.models.transformer import SpectrumTransformer  # noqa: E402
+from src.models.transformer import (  # noqa: E402
+    EOS_TOKEN,
+    REDSHIFT_TOKEN_OFFSET,
+    SOS_TOKEN,
+    SPECTRUM_TOKEN_OFFSET,
+    SpectrumTransformer,
+)
 from src.tokenizers.redshift import RedshiftTokenizer  # noqa: E402
 from src.tokenizers.spectrum import SpectrumTokenizer  # noqa: E402
 from src.training.utils import compute_metrics  # noqa: E402
 
-from dr1_dataset import load_manifest, DR1IndexedDataset  # noqa: E402
-from dr1_tokenized_dataset import (  # noqa: E402
-    DR1TokenizedDataset,
-    collate_tokenized_skip_none,
-    collect_redshifts,
+from dr1_dataset import (  # noqa: E402
+    DR1IndexedDataset,
+    collate_dr1_skip_none,
+    load_manifest,
 )
+from dr1_tokenized_dataset import collect_redshifts  # noqa: E402
 
 
 def parse_args():
@@ -103,24 +114,61 @@ def lr_at(step: int, base_lr: float, warmup: int, total: int) -> float:
     return base_lr * (0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * progress)))
 
 
+def tokenize_and_build(raw_batch, spec_tok, z_tok, approach, device):
+    """Worker batch -> transformer-ready (encoder, decoder_in, target) on device.
+
+    All sequences are fixed-length (the tokenizer interpolates to a fixed
+    grid before encoding), so no padding masks are needed.
+    """
+    flux = raw_batch["flux"].to(device, non_blocking=True)
+    ivar = raw_batch["ivar"].to(device, non_blocking=True)
+    z_vals = raw_batch["z"]  # CPU (B,)
+
+    istd = torch.sqrt(ivar.clamp(min=1e-10))
+    x = torch.stack([flux, istd], dim=1)  # (B, 2, L)
+
+    with torch.no_grad():
+        spec_indices, _ = spec_tok.encode(x)  # (B, n_tokens)
+    # Some tokenizer impls return (B, 1, n_tokens) -- squeeze if present.
+    if spec_indices.dim() == 3:
+        spec_indices = spec_indices.squeeze(1)
+    spec_tokens = spec_indices.long() + SPECTRUM_TOKEN_OFFSET
+
+    redshift_idx = torch.tensor(
+        [z_tok.encode(float(z)) for z in z_vals.tolist()],
+        dtype=torch.long, device=device,
+    )
+    redshift_tokens = redshift_idx + REDSHIFT_TOKEN_OFFSET
+
+    B = flux.shape[0]
+    sos = torch.full((B, 1), SOS_TOKEN, dtype=torch.long, device=device)
+    eos = torch.full((B, 1), EOS_TOKEN, dtype=torch.long, device=device)
+    rz = redshift_tokens.unsqueeze(1)  # (B, 1)
+
+    if approach == "a":
+        encoder_input = torch.cat([sos, rz, spec_tokens, eos], dim=1)
+    else:  # 'b'
+        encoder_input = torch.cat([sos, spec_tokens, eos], dim=1)
+
+    decoder_input = torch.cat([sos, rz, spec_tokens], dim=1)
+    target = torch.cat([rz, spec_tokens, eos], dim=1)
+    return encoder_input, decoder_input, target
+
+
 @torch.no_grad()
-def evaluate(model, loader, device, amp, vocab_size, max_batches=50):
+def evaluate(model, loader, spec_tok, z_tok, approach, device, amp, max_batches=50):
     model.eval()
     losses = 0.0
     metrics_accum = {"overall_acc": 0.0, "redshift_acc": 0.0, "spectrum_acc": 0.0}
     n = 0
-    for i, batch in enumerate(loader):
-        if batch is None:
+    for i, raw in enumerate(loader):
+        if raw is None:
             continue
         if i >= max_batches:
             break
-        enc = batch["encoder_input"].to(device, non_blocking=True)
-        dec = batch["decoder_input"].to(device, non_blocking=True)
-        tgt = batch["target"].to(device, non_blocking=True)
-        em = batch["encoder_mask"].to(device, non_blocking=True)
-        dm = batch["decoder_mask"].to(device, non_blocking=True)
+        enc, dec, tgt = tokenize_and_build(raw, spec_tok, z_tok, approach, device)
         with torch.amp.autocast("cuda", enabled=amp):
-            logits, loss = model(enc, dec, encoder_mask=em, decoder_mask=dm, targets=tgt)
+            logits, loss = model(enc, dec, targets=tgt)
         losses += float(loss.item())
         m = compute_metrics(logits, tgt)
         for k in metrics_accum:
@@ -157,16 +205,14 @@ def main():
         json.dump({k: str(v) if isinstance(v, Path) else v
                    for k, v in vars(args).items()}, f, indent=2)
 
-    # Manifest + DR1 base dataset
+    # Manifest
     print(f"[data] loading manifest {args.manifest}")
     records = load_manifest(args.manifest)
     print(f"[data] {len(records)} healpix records")
 
-    # Pretrained spectrum tokenizer
+    # Pretrained spectrum tokenizer (lives on GPU in main process; never forked)
     print(f"[tok] loading spectrum tokenizer {args.tokenizer_ckpt}")
     spec_tok = SpectrumTokenizer().to(device)
-    # weights_only=False because our checkpoint has optim/args dicts; the
-    # file is one we wrote ourselves, not untrusted input.
     ckpt = torch.load(args.tokenizer_ckpt, map_location=device, weights_only=False)
     sd = ckpt.get("model", ckpt) if isinstance(ckpt, dict) else ckpt
     spec_tok.load_state_dict(sd)
@@ -174,14 +220,14 @@ def main():
     for p in spec_tok.parameters():
         p.requires_grad_(False)
 
-    # Fit redshift tokenizer on a manifest sample
+    # Fit redshift tokenizer on a sample of manifest redshifts
     print(f"[tok] fitting redshift tokenizer on up to {args.z_fit_files} redrock files")
     zs = collect_redshifts(records, max_files=args.z_fit_files)
     print(f"[tok]   gathered {len(zs)} z values, min={zs.min():.4f} max={zs.max():.4f}")
     z_tok = RedshiftTokenizer(n_levels=256)
     z_tok.fit(zs)
 
-    # Datasets
+    # Datasets -- raw spectra only (CPU). Workers safe to fork.
     base = DR1IndexedDataset(
         records,
         require_good_zwarn=True,
@@ -190,13 +236,11 @@ def main():
     )
     print(f"[data] {len(base)} spectra in flat index")
 
-    full = DR1TokenizedDataset(base, spec_tok, z_tok, approach=args.approach, device=device)
-
     g = torch.Generator().manual_seed(args.seed)
-    perm = torch.randperm(len(full), generator=g).tolist()
-    n_val = max(1, int(len(full) * args.val_frac))
+    perm = torch.randperm(len(base), generator=g).tolist()
+    n_val = max(1, int(len(base) * args.val_frac))
     val_idx, train_idx = perm[:n_val], perm[n_val:]
-    train_ds, val_ds = Subset(full, train_idx), Subset(full, val_idx)
+    train_ds, val_ds = Subset(base, train_idx), Subset(base, val_idx)
     print(f"[data] train={len(train_ds)} val={len(val_ds)}")
 
     train_loader = DataLoader(
@@ -204,7 +248,7 @@ def main():
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        collate_fn=collate_tokenized_skip_none,
+        collate_fn=collate_dr1_skip_none,
         pin_memory=device.type == "cuda",
         persistent_workers=args.num_workers > 0,
         drop_last=True,
@@ -214,7 +258,7 @@ def main():
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=max(0, args.num_workers // 2),
-        collate_fn=collate_tokenized_skip_none,
+        collate_fn=collate_dr1_skip_none,
         pin_memory=device.type == "cuda",
     )
 
@@ -240,25 +284,21 @@ def main():
 
     while step < args.steps:
         try:
-            batch = next(train_iter)
+            raw = next(train_iter)
         except StopIteration:
             train_iter = iter(train_loader)
-            batch = next(train_iter)
-        if batch is None:
+            raw = next(train_iter)
+        if raw is None:
             continue
 
         for g_ in optim.param_groups:
             g_["lr"] = lr_at(step, args.lr, args.warmup, args.steps)
 
-        enc = batch["encoder_input"].to(device, non_blocking=True)
-        dec = batch["decoder_input"].to(device, non_blocking=True)
-        tgt = batch["target"].to(device, non_blocking=True)
-        em = batch["encoder_mask"].to(device, non_blocking=True)
-        dm = batch["decoder_mask"].to(device, non_blocking=True)
+        enc, dec, tgt = tokenize_and_build(raw, spec_tok, z_tok, args.approach, device)
 
         optim.zero_grad(set_to_none=True)
         with torch.amp.autocast("cuda", enabled=args.amp):
-            logits, loss = model(enc, dec, encoder_mask=em, decoder_mask=dm, targets=tgt)
+            logits, loss = model(enc, dec, targets=tgt)
         scaler.scale(loss).backward()
         if args.grad_clip > 0:
             scaler.unscale_(optim)
@@ -283,11 +323,12 @@ def main():
                 f.write(json.dumps(msg) + "\n")
 
         if step > 0 and step % args.val_every == 0:
-            v = evaluate(model, val_loader, device, args.amp, model.vocab_size)
+            v = evaluate(model, val_loader, spec_tok, z_tok, args.approach, device, args.amp)
             model.train()
             print(f"[val   {step:6d}] " + " ".join(f"{k}={v[k]:.4f}" for k in v))
             with metrics_path.open("a") as f:
-                f.write(json.dumps({"kind": "val", "step": step, **{f"val_{k}": vv for k, vv in v.items()}}) + "\n")
+                f.write(json.dumps({"kind": "val", "step": step,
+                                    **{f"val_{k}": vv for k, vv in v.items()}}) + "\n")
             if v["loss"] < best_val:
                 best_val = v["loss"]
                 p = run_dir / "best.pt"
@@ -297,7 +338,6 @@ def main():
                     "optim": optim.state_dict(),
                     "scaler": scaler.state_dict(),
                     "val_loss": best_val,
-                    "args": vars(args) | {k: str(v) for k, v in vars(args).items() if isinstance(v, Path)},
                 }, p)
                 print(f"  *** new best val_loss={best_val:.4f} -> {p}")
                 if args.cfs_out is not None:
