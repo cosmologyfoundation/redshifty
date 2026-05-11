@@ -382,37 +382,57 @@ class SpectrumTransformer(nn.Module):
         encoder_mask: Optional[torch.Tensor] = None,
         decoder_mask: Optional[torch.Tensor] = None,
         targets: Optional[torch.Tensor] = None,
+        redshift_weight: float = 1.0,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Full forward pass.
-        
+
         Args:
             encoder_input_ids: (B, L_enc) encoder input
             decoder_input_ids: (B, L_dec) decoder input (teacher forced)
             encoder_mask: (B, L_enc) encoder padding mask
             decoder_mask: (B, L_dec) decoder padding mask
             targets: (B, L_dec) target tokens for loss
-            
+            redshift_weight: scalar multiplier on the position-0 (redshift)
+                cross-entropy term relative to the position-1+ (spectrum)
+                term. The two terms are first reduced to per-token means,
+                then combined as `redshift_weight * loss_redshift + loss_spectrum`.
+                Default 1.0 keeps the two contributions on equal per-token
+                footing. Set higher (e.g. 50) to force the model to learn
+                the redshift token despite spectrum tokens dominating the
+                position count.
+
         Returns:
             logits: (B, L_dec, vocab_size)
             loss: scalar cross-entropy loss (if targets provided)
         """
         assert encoder_input_ids.shape[1] <= self.max_seq_len
         assert decoder_input_ids.shape[1] <= self.max_seq_len
-        
+
         # Encode
         encoder_out = self.encode(encoder_input_ids, encoder_mask)
-        
+
         # Decode
         logits = self.decode(decoder_input_ids, encoder_out, decoder_mask, encoder_mask)
-        
+
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(
+            B, L = targets.shape
+            per_token = F.cross_entropy(
                 logits.view(-1, self.vocab_size),
                 targets.view(-1),
                 ignore_index=-100,
-            )
-        
+                reduction="none",
+            ).view(B, L)
+            valid = (targets != -100).float()
+            n_red = valid[:, 0].sum().clamp(min=1.0)
+            if L > 1:
+                n_spec = valid[:, 1:].sum().clamp(min=1.0)
+                loss_red = (per_token[:, 0] * valid[:, 0]).sum() / n_red
+                loss_spec = (per_token[:, 1:] * valid[:, 1:]).sum() / n_spec
+                loss = redshift_weight * loss_red + loss_spec
+            else:
+                loss = (per_token[:, 0] * valid[:, 0]).sum() / n_red
+
         return logits, loss
     
     @torch.no_grad()

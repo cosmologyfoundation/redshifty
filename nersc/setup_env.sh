@@ -29,7 +29,9 @@ echo "[2/3] pip install project deps"
 python -m pip install --user --no-cache-dir \
     "astropy>=6.0" \
     "fitsio>=1.2" \
-    "tqdm>=4.66"
+    "tqdm>=4.66" \
+    "wandb>=0.16" \
+    "python-dotenv>=1.0"
 
 echo "[3/3] create scratch dirs"
 mkdir -p "$SCRATCH/deepsrch/checkpoints"

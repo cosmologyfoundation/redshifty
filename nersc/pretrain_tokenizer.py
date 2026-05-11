@@ -42,6 +42,7 @@ from dr1_dataset import (  # noqa: E402
     collate_dr1_skip_none,
     load_manifest,
 )
+from _wandb_util import init_wandb, wfinish, wlog  # noqa: E402
 
 
 def parse_args():
@@ -77,6 +78,9 @@ def parse_args():
     p.add_argument("--log-every", type=int, default=20)
     p.add_argument("--val-every", type=int, default=500)
     p.add_argument("--save-every", type=int, default=2000)
+    p.add_argument("--wandb-mode", choices=["online", "offline", "disabled"],
+                   default="online")
+    p.add_argument("--wandb-project", type=str, default="redshifty")
 
     # Smoke test toggle
     p.add_argument("--smoke", action="store_true",
@@ -195,6 +199,22 @@ def main():
     )
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp)
 
+    # Wandb init
+    wandb_config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
+    wandb_config.update({
+        "n_params": n_params,
+        "n_train": len(train_ds),
+        "n_val": len(val_ds),
+    })
+    wandb_dir = args.scratch_out / "wandb" / args.run_name
+    wandb_run = init_wandb(
+        mode=args.wandb_mode,
+        project=args.wandb_project,
+        run_name=args.run_name,
+        config=wandb_config,
+        out_dir=wandb_dir,
+    )
+
     # Train
     step = 0
     best_val = float("inf")
@@ -252,6 +272,13 @@ def main():
             )
             with metrics_path.open("a") as f:
                 f.write(json.dumps(msg) + "\n")
+            wlog(wandb_run, {
+                "train/loss_total": msg["loss_total"],
+                "train/loss_recon": msg["loss_recon"],
+                "train/loss_quant": msg["loss_quant"],
+                "train/lr": msg["lr"],
+                "train/steps_per_sec": rate,
+            }, step=step)
 
         if step > 0 and step % args.val_every == 0:
             val_losses = evaluate(model, val_loader, device, args.amp)
@@ -260,6 +287,7 @@ def main():
             print(f"[val   {step:6d}] " + " ".join(f"{k}={v:.4f}" for k, v in val_losses.items()))
             with metrics_path.open("a") as f:
                 f.write(json.dumps(msg) + "\n")
+            wlog(wandb_run, {f"val/{k}": v for k, v in val_losses.items()}, step=step)
 
             if val_losses["total"] < best_val:
                 best_val = val_losses["total"]
@@ -294,6 +322,7 @@ def main():
         shutil.copy2(p, args.cfs_out / "final.pt")
         print(f"[done] mirrored final -> {args.cfs_out / 'final.pt'}")
     print(f"[done] best val_loss={best_val:.4f}")
+    wfinish(wandb_run)
 
 
 if __name__ == "__main__":

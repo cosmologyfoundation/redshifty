@@ -7,6 +7,7 @@ import json
 import time
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from typing import Dict, Optional, Tuple
 from pathlib import Path
@@ -69,6 +70,41 @@ def compute_metrics(logits: torch.Tensor, target: torch.Tensor) -> Dict[str, flo
         'overall_acc': overall_acc.item(),
         'redshift_acc': pos0_acc.item(),
         'spectrum_acc': spec_acc.item(),
+    }
+
+
+def compute_loss_breakdown(logits: torch.Tensor, target: torch.Tensor) -> Dict[str, float]:
+    """Unweighted per-segment loss for logging.
+
+    Partitions the cross-entropy loss into the position-0 (redshift) and
+    position-1+ (spectrum) contributions, each reduced to a mean over
+    valid (non -100) positions. Returns three floats; useful for tracking
+    whether the redshift branch is actually learning even when the
+    backprop loss uses a non-unit redshift_weight.
+    """
+    B, L = target.shape
+    per_token = F.cross_entropy(
+        logits.view(-1, logits.shape[-1]),
+        target.view(-1),
+        ignore_index=-100,
+        reduction='none',
+    ).view(B, L)
+    valid = (target != -100).float()
+    n_red = valid[:, 0].sum().clamp(min=1.0)
+    loss_red = (per_token[:, 0] * valid[:, 0]).sum() / n_red
+    if L > 1:
+        n_spec = valid[:, 1:].sum().clamp(min=1.0)
+        loss_spec = (per_token[:, 1:] * valid[:, 1:]).sum() / n_spec
+    else:
+        loss_spec = torch.zeros((), device=logits.device)
+    # "Total" here is the unweighted mean over all valid positions; this is
+    # the comparable-to-vanilla number, not what backprop uses.
+    n_all = valid.sum().clamp(min=1.0)
+    loss_total = (per_token * valid).sum() / n_all
+    return {
+        'loss_redshift': loss_red.item(),
+        'loss_spectrum': loss_spec.item(),
+        'loss_total': loss_total.item(),
     }
 
 

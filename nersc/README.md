@@ -120,6 +120,52 @@ record per log step or val pass. Plot it locally with whatever you like.
 | Job killed at 8 weeks | `$SCRATCH` purge ate the checkpoint | mirror to `$CFS_OUT` is what `pretrain_tokenizer.py` does — use that copy |
 | `ImportError: cannot import name 'GradScaler'` | very old torch; we use `torch.amp.GradScaler` API | upgrade to `pytorch/2.3.1` or newer module |
 
+## Weights & Biases
+
+Both NERSC trainers (`pretrain_tokenizer.py`, `train_transformer.py`) log
+to wandb out of the box. Setup:
+
+1. Put your API key in a `.env` at the repo root (gitignored):
+   ```
+   WANDB_API_KEY=<your-key>
+   ```
+   `setup_env.sh` already pip-installs `python-dotenv` and `wandb`.
+
+2. Submit normally; the trainers call `load_dotenv()` and `wandb.init()`
+   automatically. Default project is `redshifty` (override with
+   `--wandb-project`).
+
+Modes (env var or CLI flag):
+
+| Mode | When to use |
+|---|---|
+| `online` (default) | Compute node has outbound HTTPS — most Perlmutter jobs |
+| `offline` | Network is flaky or you don't want live logging |
+| `disabled` | Smoke tests / debugging |
+
+Override per-run:
+```bash
+# pass via CLI...
+... --wandb-mode offline --wandb-project redshifty-debug
+
+# ...or via env var
+WANDB_MODE=offline sbatch nersc/train_transformer.slurm
+```
+
+If you ran offline, sync from a login node afterwards:
+```bash
+wandb sync $SCRATCH/deepsrch/wandb/<run-name>
+```
+
+## Redshift loss weighting
+
+`train_transformer.py` accepts `--redshift-loss-weight` (default **50.0**).
+This multiplies the position-0 (redshift) cross-entropy term relative to
+the position-1+ (spectrum) term. With 272 spectrum tokens vs 1 redshift
+token, the default of 50 gives redshift ~15% of the effective gradient
+share (vs ~0.4% unweighted), which is enough to actually train the
+redshift prediction. Set `--redshift-loss-weight 1.0` to disable.
+
 ## Stage 2: Train the transformer with a pretrained tokenizer
 
 Once `pretrain_tokenizer.slurm` (or the trial run) lands a `best.pt` you

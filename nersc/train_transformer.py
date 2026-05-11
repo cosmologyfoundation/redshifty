@@ -51,7 +51,7 @@ from src.models.transformer import (  # noqa: E402
 )
 from src.tokenizers.redshift import RedshiftTokenizer  # noqa: E402
 from src.tokenizers.spectrum import SpectrumTokenizer  # noqa: E402
-from src.training.utils import compute_metrics  # noqa: E402
+from src.training.utils import compute_loss_breakdown, compute_metrics  # noqa: E402
 
 from dr1_dataset import (  # noqa: E402
     DR1IndexedDataset,
@@ -59,6 +59,7 @@ from dr1_dataset import (  # noqa: E402
     load_manifest,
 )
 from dr1_tokenized_dataset import collect_redshifts  # noqa: E402
+from _wandb_util import init_wandb, wfinish, wlog  # noqa: E402
 
 
 def parse_args():
@@ -92,9 +93,17 @@ def parse_args():
     p.add_argument("--warmup", type=int, default=1000)
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--amp", action="store_true")
+    p.add_argument("--redshift-loss-weight", type=float, default=50.0,
+                   help="Multiplier on the position-0 (redshift) loss term "
+                        "relative to the position-1+ (spectrum) term. "
+                        "Defaults to 50 to compensate for redshift being 1/274 "
+                        "of the sequence; set 1.0 to disable.")
 
     # Logging
     p.add_argument("--run-name", type=str, default="approach_a")
+    p.add_argument("--wandb-mode", choices=["online", "offline", "disabled"],
+                   default="online")
+    p.add_argument("--wandb-project", type=str, default="redshifty")
     p.add_argument("--scratch-out", type=Path,
                    default=Path(os.environ.get("SCRATCH", "/tmp")) / "deepsrch")
     p.add_argument("--cfs-out", type=Path, default=None)
@@ -156,10 +165,12 @@ def tokenize_and_build(raw_batch, spec_tok, z_tok, approach, device):
 
 
 @torch.no_grad()
-def evaluate(model, loader, spec_tok, z_tok, approach, device, amp, max_batches=50):
+def evaluate(model, loader, spec_tok, z_tok, approach, device, amp,
+             redshift_weight: float, max_batches: int = 50):
     model.eval()
     losses = 0.0
     metrics_accum = {"overall_acc": 0.0, "redshift_acc": 0.0, "spectrum_acc": 0.0}
+    breakdown_accum = {"loss_redshift": 0.0, "loss_spectrum": 0.0, "loss_total": 0.0}
     n = 0
     for i, raw in enumerate(loader):
         if raw is None:
@@ -168,15 +179,22 @@ def evaluate(model, loader, spec_tok, z_tok, approach, device, amp, max_batches=
             break
         enc, dec, tgt = tokenize_and_build(raw, spec_tok, z_tok, approach, device)
         with torch.amp.autocast("cuda", enabled=amp):
-            logits, loss = model(enc, dec, targets=tgt)
+            logits, loss = model(enc, dec, targets=tgt, redshift_weight=redshift_weight)
         losses += float(loss.item())
         m = compute_metrics(logits, tgt)
         for k in metrics_accum:
             metrics_accum[k] += m[k]
+        b = compute_loss_breakdown(logits, tgt)
+        for k in breakdown_accum:
+            breakdown_accum[k] += b[k]
         n += 1
     if n == 0:
-        return {"loss": float("nan"), **{k: float("nan") for k in metrics_accum}}
-    return {"loss": losses / n, **{k: v / n for k, v in metrics_accum.items()}}
+        nan = float("nan")
+        return {"loss": nan, **{k: nan for k in metrics_accum},
+                **{k: nan for k in breakdown_accum}}
+    out = {"loss": losses / n, **{k: v / n for k, v in metrics_accum.items()}}
+    out.update({k: v / n for k, v in breakdown_accum.items()})
+    return out
 
 
 def main():
@@ -276,6 +294,23 @@ def main():
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp)
 
+    # Wandb init
+    wandb_config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
+    wandb_config.update({
+        "n_params": n_params,
+        "n_train": len(train_ds),
+        "n_val": len(val_ds),
+        "n_manifest_records": len(records),
+    })
+    wandb_dir = args.scratch_out / "wandb" / args.run_name
+    wandb_run = init_wandb(
+        mode=args.wandb_mode,
+        project=args.wandb_project,
+        run_name=args.run_name,
+        config=wandb_config,
+        out_dir=wandb_dir,
+    )
+
     step = 0
     best_val = float("inf")
     t0 = time.time()
@@ -298,7 +333,8 @@ def main():
 
         optim.zero_grad(set_to_none=True)
         with torch.amp.autocast("cuda", enabled=args.amp):
-            logits, loss = model(enc, dec, targets=tgt)
+            logits, loss = model(enc, dec, targets=tgt,
+                                 redshift_weight=args.redshift_loss_weight)
         scaler.scale(loss).backward()
         if args.grad_clip > 0:
             scaler.unscale_(optim)
@@ -309,26 +345,42 @@ def main():
         if step % args.log_every == 0:
             with torch.no_grad():
                 m = compute_metrics(logits, tgt)
+                b = compute_loss_breakdown(logits, tgt)
             dt = time.time() - t0
             rate = (step + 1) / max(dt, 1e-6)
             msg = {
                 "kind": "train", "step": step, "lr": optim.param_groups[0]["lr"],
                 "loss": float(loss.item()),
-                **m, "steps_per_sec": rate, "elapsed_s": dt,
+                **m, **b,
+                "steps_per_sec": rate, "elapsed_s": dt,
             }
             print(f"[step {step:6d}] loss={msg['loss']:.4f} "
-                  f"acc={m['overall_acc']:.3f} z_acc={m['redshift_acc']:.3f} "
-                  f"spec_acc={m['spectrum_acc']:.3f} {rate:.1f} step/s")
+                  f"z_loss={b['loss_redshift']:.3f} spec_loss={b['loss_spectrum']:.3f} "
+                  f"z_acc={m['redshift_acc']:.3f} spec_acc={m['spectrum_acc']:.3f} "
+                  f"{rate:.1f} step/s")
             with metrics_path.open("a") as f:
                 f.write(json.dumps(msg) + "\n")
+            wlog(wandb_run, {
+                "train/loss": msg["loss"],
+                "train/loss_redshift": b["loss_redshift"],
+                "train/loss_spectrum": b["loss_spectrum"],
+                "train/loss_total_unweighted": b["loss_total"],
+                "train/lr": msg["lr"],
+                "train/overall_acc": m["overall_acc"],
+                "train/redshift_acc": m["redshift_acc"],
+                "train/spectrum_acc": m["spectrum_acc"],
+                "train/steps_per_sec": rate,
+            }, step=step)
 
         if step > 0 and step % args.val_every == 0:
-            v = evaluate(model, val_loader, spec_tok, z_tok, args.approach, device, args.amp)
+            v = evaluate(model, val_loader, spec_tok, z_tok, args.approach, device,
+                         args.amp, args.redshift_loss_weight)
             model.train()
             print(f"[val   {step:6d}] " + " ".join(f"{k}={v[k]:.4f}" for k in v))
             with metrics_path.open("a") as f:
                 f.write(json.dumps({"kind": "val", "step": step,
                                     **{f"val_{k}": vv for k, vv in v.items()}}) + "\n")
+            wlog(wandb_run, {f"val/{k}": vv for k, vv in v.items()}, step=step)
             if v["loss"] < best_val:
                 best_val = v["loss"]
                 p = run_dir / "best.pt"
@@ -357,6 +409,8 @@ def main():
     if args.cfs_out is not None:
         args.cfs_out.mkdir(parents=True, exist_ok=True)
         shutil.copy2(p, args.cfs_out / "final.pt")
+
+    wfinish(wandb_run)
 
 
 if __name__ == "__main__":

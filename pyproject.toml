@@ -32,6 +32,7 @@ dependencies = [
     "h5py",
     "scipy",
     "wandb",
+    "python-dotenv>=1.0",
 ]
 
 [project.optional-dependencies]
