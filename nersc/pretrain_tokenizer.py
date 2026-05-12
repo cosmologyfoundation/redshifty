@@ -141,6 +141,11 @@ def main():
         local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_LOCALID", "0")))
         rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", "0")))
         world_size = int(os.environ.get("WORLD_SIZE", os.environ.get("SLURM_NTASKS", "1")))
+        # PyTorch env:// rendezvous requires RANK/WORLD_SIZE/MASTER_ADDR/MASTER_PORT
+        os.environ["RANK"] = str(rank)
+        os.environ["WORLD_SIZE"] = str(world_size)
+        os.environ.setdefault("MASTER_ADDR", "localhost")
+        os.environ.setdefault("MASTER_PORT", "29500")
         if "CUDA_VISIBLE_DEVICES" not in os.environ:
             os.environ["CUDA_VISIBLE_DEVICES"] = str(local_rank)
         dist.init_process_group(backend="nccl")
