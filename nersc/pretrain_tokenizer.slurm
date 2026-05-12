@@ -38,7 +38,9 @@ NUM_WORKERS="${NUM_WORKERS:-8}"
 # -------------------------------------
 
 MANIFEST="$SCRATCH_OUT/manifests/dr1_${SLURM_JOB_ID}.jsonl"
-CFS_OUT="${CFS_OUT:-$REPO/checkpoints/nersc/$RUN_NAME}"
+# CFS mirror lives under the project CFS dir (multi-TB quota), not $HOME (40 GB).
+DEFAULT_CFS_BASE="/global/cfs/cdirs/deepsrch/$USER/checkpoints"
+CFS_OUT="${CFS_OUT:-$DEFAULT_CFS_BASE/$RUN_NAME}"
 
 echo "[pretrain] run_name=$RUN_NAME"
 echo "[pretrain] manifest=$MANIFEST  (max_healpix=$MAX_HEALPIX)"

@@ -68,7 +68,10 @@ WANDB_PROJECT="${WANDB_PROJECT:-redshifty}"
 # -------------------------------------
 
 MANIFEST="${MANIFEST:-$SCRATCH_OUT/manifests/dr1_${MAX_HEALPIX}.jsonl}"
-CFS_OUT="${CFS_OUT:-$REPO/checkpoints/nersc/$RUN_NAME}"
+# CFS mirror lives under the project CFS dir (deepsrch has multi-TB quota)
+# rather than $HOME (40 GB quota -> fills up fast with ~300 MB checkpoints).
+DEFAULT_CFS_BASE="/global/cfs/cdirs/deepsrch/$USER/checkpoints"
+CFS_OUT="${CFS_OUT:-$DEFAULT_CFS_BASE/$RUN_NAME}"
 
 echo "[train] approach=$APPROACH run=$RUN_NAME"
 echo "[train] manifest=$MANIFEST  cfs_out=$CFS_OUT"

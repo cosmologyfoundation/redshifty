@@ -66,10 +66,19 @@ Perlmutter has three filesystems. We use them like this:
 
 | Where | What lives there | Why |
 |---|---|---|
-| `$HOME` | the cloned repo | small, durable |
+| `$HOME` | the cloned repo only | small (40 GB quota) — **don't put checkpoints here** |
 | `$SCRATCH/deepsrch/` | manifests, checkpoints, logs *during* training | high-perf Lustre |
 | `$CFS/desi/public/dr1` | the dataset (read-only) | already there, world-readable |
-| `checkpoints/nersc/<run>/` (in repo) | best/final checkpoint mirror | survives `$SCRATCH` purge |
+| `/global/cfs/cdirs/deepsrch/$USER/checkpoints/<run>/` | best/final checkpoint mirror | multi-TB project quota, survives `$SCRATCH` purge |
+
+**Why not mirror to the repo under `$HOME/redshifty/checkpoints/`?** Because
+`$HOME` is 40 GB. With ~300 MB best.pt files written on every val-loss
+improvement, you'll exhaust quota mid-run and the training process will
+crash on `OSError: [Errno 122] Disk quota exceeded`. The SLURM scripts
+default `CFS_OUT` to `/global/cfs/cdirs/deepsrch/$USER/checkpoints/$RUN_NAME`
+for this reason. As a safety net, both trainers also wrap the mirror in a
+try/except since Phase 10 — a failed mirror prints a warning but does not
+kill the training process.
 
 `$SCRATCH` is **purged** after ~8 weeks idle. `pretrain_tokenizer.py`
 mirrors the best checkpoint to `$CFS_OUT` (defaulted into the repo

@@ -303,8 +303,12 @@ def main():
                 torch.save(ckpt, p)
                 print(f"  *** new best val_loss={best_val:.4f} -> {p}")
                 if args.cfs_out is not None:
-                    args.cfs_out.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(p, args.cfs_out / "best.pt")
+                    try:
+                        args.cfs_out.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(p, args.cfs_out / "best.pt")
+                    except OSError as e:
+                        print(f"  WARN: cfs_out mirror failed ({e}); "
+                              f"SCRATCH best.pt is safe at {p}")
 
         if step > 0 and step % args.save_every == 0:
             p = run_dir / f"step_{step:08d}.pt"
@@ -318,9 +322,13 @@ def main():
     torch.save({"step": step, "model": model.state_dict()}, p)
     print(f"[done] final -> {p}")
     if args.cfs_out is not None:
-        args.cfs_out.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(p, args.cfs_out / "final.pt")
-        print(f"[done] mirrored final -> {args.cfs_out / 'final.pt'}")
+        try:
+            args.cfs_out.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(p, args.cfs_out / "final.pt")
+            print(f"[done] mirrored final -> {args.cfs_out / 'final.pt'}")
+        except OSError as e:
+            print(f"  WARN: cfs_out final mirror failed ({e}); "
+                  f"SCRATCH final.pt is safe at {p}")
     print(f"[done] best val_loss={best_val:.4f}")
     wfinish(wandb_run)
 

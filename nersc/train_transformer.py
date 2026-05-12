@@ -359,8 +359,12 @@ def main():
                 }, p)
                 print(f"  *** new best val_loss={best_val:.4f} -> {p}")
                 if args.cfs_out is not None:
-                    args.cfs_out.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(p, args.cfs_out / "best.pt")
+                    try:
+                        args.cfs_out.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(p, args.cfs_out / "best.pt")
+                    except OSError as e:
+                        print(f"  WARN: cfs_out mirror failed ({e}); "
+                              f"SCRATCH best.pt is safe at {p}")
 
                 # Push the FULL best.pt (incl. optim/scaler state) to
                 # wandb as an Artifact. We have headroom on the wandb
@@ -417,8 +421,12 @@ def main():
     }, p)
     print(f"[done] final -> {p}  best_val_loss={best_val:.4f}")
     if args.cfs_out is not None:
-        args.cfs_out.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(p, args.cfs_out / "final.pt")
+        try:
+            args.cfs_out.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(p, args.cfs_out / "final.pt")
+        except OSError as e:
+            print(f"  WARN: cfs_out final mirror failed ({e}); "
+                  f"SCRATCH final.pt is safe at {p}")
 
     if args.push_wandb_artifact and wandb_run is not None:
         log_model_artifact(
