@@ -31,6 +31,12 @@
 
 set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
+
+# --- Edit these for your manifest ---
+export SRC_MANIFEST="${SRC_MANIFEST:-$SCRATCH/deepsrch/manifests/dr1_10k.jsonl}"
+export DST_MANIFEST="${DST_MANIFEST:-$SCRATCH/deepsrch/manifests/dr1_10k_scratch.jsonl}"
+# ------------------------------------
+
 module load "${PYTORCH_MODULE:-pytorch/2.8.0}"
 
 if [ -z "${SRC_MANIFEST:-}" ]; then
