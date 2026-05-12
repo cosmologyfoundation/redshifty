@@ -50,7 +50,7 @@ from src.training.utils import (  # noqa: E402
     compute_masked_metrics,
     compute_metrics,
 )
-from src.training.wandb_util import init_wandb, wfinish, wlog  # noqa: E402
+from src.training.wandb_util import init_wandb, log_model_artifact, wfinish, wlog  # noqa: E402
 
 # NERSC-specific DR1 loaders.
 from dr1_dataset import (  # noqa: E402
@@ -109,6 +109,11 @@ def parse_args():
     p.add_argument("--wandb-mode", choices=["online", "offline", "disabled"],
                    default="online")
     p.add_argument("--wandb-project", type=str, default="redshifty")
+    p.add_argument("--push-wandb-artifact", action="store_true", default=True,
+                   help="Upload a slim model-only best.pt to wandb as an Artifact "
+                        "on each best update (and final). Disable with --no-push-wandb-artifact.")
+    p.add_argument("--no-push-wandb-artifact", action="store_false",
+                   dest="push_wandb_artifact")
     p.add_argument("--scratch-out", type=Path,
                    default=Path(os.environ.get("SCRATCH", "/tmp")) / "deepsrch")
     p.add_argument("--cfs-out", type=Path, default=None)
@@ -337,11 +342,42 @@ def main():
                     "optim": optim.state_dict(),
                     "scaler": scaler.state_dict(),
                     "val_loss": best_val,
+                    # State for downstream visualization / inference. Travels
+                    # with the .pt so a notebook can decode redshift bins
+                    # back to z values without re-fitting on a sample that
+                    # may not match the training distribution.
+                    "z_tokenizer": {
+                        "sorted_z": z_tok._sorted_z.cpu(),
+                        "n_levels": z_tok.n_levels,
+                        "gaussian_range": z_tok.gaussian_range,
+                    },
+                    "tokenizer_ckpt_path": str(args.tokenizer_ckpt),
+                    "approach": args.approach,
+                    "encoder_mask_ratio": args.encoder_mask_ratio,
                 }, p)
                 print(f"  *** new best val_loss={best_val:.4f} -> {p}")
                 if args.cfs_out is not None:
                     args.cfs_out.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(p, args.cfs_out / "best.pt")
+
+                # Push the FULL best.pt (incl. optim/scaler state) to
+                # wandb as an Artifact. We have headroom on the wandb
+                # storage budget and a full ckpt lets us resume training
+                # from a wandb pull, not just visualize.
+                if args.push_wandb_artifact and wandb_run is not None:
+                    log_model_artifact(
+                        wandb_run, p,
+                        name=f"approach_{args.approach}_{args.run_name}",
+                        aliases=["best", f"step_{step}"],
+                        metadata={
+                            "val_loss": best_val,
+                            "step": step,
+                            "approach": args.approach,
+                            "encoder_mask_ratio": args.encoder_mask_ratio,
+                            "redshift_loss_weight": args.redshift_loss_weight,
+                            "full_state": True,
+                        },
+                    )
 
                 # AR eval on the new best (cheap-ish).
                 ar = evaluate_ar(
@@ -365,11 +401,30 @@ def main():
 
     # Final
     p = run_dir / "final.pt"
-    torch.save({"step": step, "model": model.state_dict()}, p)
+    torch.save({
+        "step": step,
+        "model": model.state_dict(),
+        "z_tokenizer": {
+            "sorted_z": z_tok._sorted_z.cpu(),
+            "n_levels": z_tok.n_levels,
+            "gaussian_range": z_tok.gaussian_range,
+        },
+        "tokenizer_ckpt_path": str(args.tokenizer_ckpt),
+        "approach": args.approach,
+        "encoder_mask_ratio": args.encoder_mask_ratio,
+    }, p)
     print(f"[done] final -> {p}  best_val_loss={best_val:.4f}")
     if args.cfs_out is not None:
         args.cfs_out.mkdir(parents=True, exist_ok=True)
         shutil.copy2(p, args.cfs_out / "final.pt")
+
+    if args.push_wandb_artifact and wandb_run is not None:
+        log_model_artifact(
+            wandb_run, p,
+            name=f"approach_{args.approach}_{args.run_name}",
+            aliases=["final", f"step_{step}"],
+            metadata={"step": step, "approach": args.approach},
+        )
 
     # AR eval on final.
     ar_final = evaluate_ar(

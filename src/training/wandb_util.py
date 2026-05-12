@@ -106,3 +106,51 @@ def wfinish(run):
         run.finish()
     except Exception:
         pass
+
+
+def log_model_artifact(
+    run,
+    ckpt_path,
+    name: str,
+    aliases=None,
+    metadata=None,
+):
+    """Upload a checkpoint to wandb as a model artifact.
+
+    Use sparingly — wandb has storage limits, so prefer slim model-only
+    checkpoints (no optim/scaler state). For the redshifty project,
+    best.pt with full optim state is ~300 MB; a slim model-only version
+    is ~100 MB. Recommended pattern: write a slim copy alongside best.pt
+    and log THAT.
+
+    Args:
+        run: wandb run from init_wandb (or None — no-op).
+        ckpt_path: path to the .pt file to upload.
+        name: artifact name (e.g. "approach_a_best"). Versioned
+            automatically by wandb (v0, v1, ...).
+        aliases: list of human-readable aliases to attach
+            (e.g. ["best", "step_12000"]).
+        metadata: optional dict of key=value pairs to attach.
+
+    Returns:
+        wandb.Artifact or None.
+    """
+    if run is None:
+        return None
+    try:
+        import wandb
+    except ImportError:
+        return None
+    try:
+        art = wandb.Artifact(
+            name=name,
+            type="model",
+            metadata=metadata or {},
+        )
+        art.add_file(str(ckpt_path))
+        run.log_artifact(art, aliases=aliases or [])
+        print(f"[wandb] logged artifact {name} <- {ckpt_path}")
+        return art
+    except Exception as e:
+        print(f"[wandb] artifact upload failed ({e!r})")
+        return None

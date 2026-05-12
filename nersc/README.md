@@ -191,6 +191,74 @@ Set `--encoder-mask-ratio 0.0` to disable (will reproduce the dishonest 99% patt
 for validation rather than splitting by row. Eliminates same-pointing
 leakage (fibers in the same exposure share sky background, conditions).
 
+## Wandb model artifacts (auto-uploaded)
+
+By default, `train_transformer.py` uploads a slim model-only copy of
+`best.pt` (with redshift-tokenizer state baked in, no optimizer/scaler)
+to wandb on each best-checkpoint update and at end of run. Stored as a
+versioned `wandb.Artifact`, viewable in the project's Artifacts tab.
+
+Notebook usage (no `scp` required):
+
+```python
+ARTIFACT_URI = 'jonathansamuel/redshifty/approach_a_<run-name>:best'
+api = wandb.Api()
+art = api.artifact(ARTIFACT_URI, type='model')
+art.download(root='checkpoints/wandb_artifacts/...')
+```
+
+The visualization notebook `notebooks/07_visualize_predictions.ipynb`
+has a cell for this. Set `ARTIFACT_URI = None` to fall back to a local
+`scp`-ed checkpoint.
+
+Disable artifact upload with `--no-push-wandb-artifact` (e.g. for sweep
+runs where you don't want to flood storage).
+
+## Staging DR1 from CFS to SCRATCH (for I/O speedup)
+
+`$CFS` is *not tuned* for the random small-file FITS reads that
+DataLoader workers do — it was the bottleneck in Phase 8 (1.05 step/s
+on a 24M-param tokenizer; ~200-500 spec/s would be GPU-bound). Staging
+the relevant healpix files to `$SCRATCH` (Lustre) once before a long
+training run typically gives a **5-10× step-rate speedup**.
+
+Workflow:
+
+```bash
+# 1. (One-time) build the manifest you want to train on
+python nersc/build_dr1_index.py \
+    --root /global/cfs/cdirs/desi/public/dr1 \
+    --surveys sv3 main --programs bright dark \
+    --max-healpix 2000 \
+    --out $SCRATCH/deepsrch/manifests/dr1_2k.jsonl
+
+# 2. Stage CFS -> SCRATCH (CPU-only SLURM job; ~5-10 min for ~50 GB)
+SRC_MANIFEST=$SCRATCH/deepsrch/manifests/dr1_2k.jsonl \
+    sbatch nersc/stage_to_scratch.slurm
+
+# 3. Train using the rewritten manifest pointing at SCRATCH paths
+MANIFEST=$SCRATCH/deepsrch/manifests/dr1_2k_scratch.jsonl \
+    TOKENIZER_CKPT=$TOK APPROACH=a \
+    sbatch nersc/train_transformer.slurm
+```
+
+The staging script is **idempotent** — re-running on the same source
+manifest skips files already present in the destination. You can stage
+small manifests directly from a login node too:
+
+```bash
+python nersc/stage_to_scratch.py \
+    --src-manifest $SCRATCH/deepsrch/manifests/dr1_smoke.jsonl \
+    --dst-root     $SCRATCH/deepsrch/dr1_staged \
+    --dst-manifest $SCRATCH/deepsrch/manifests/dr1_smoke_scratch.jsonl
+```
+
+**Watch out for `$SCRATCH` purge**: files not accessed within ~8 weeks
+get deleted. Stage right before a training campaign, not months ahead.
+
+References: <https://docs.nersc.gov/filesystems/>,
+<https://docs.nersc.gov/filesystems/perlmutter-scratch/>.
+
 ## SLURM env-var overrides
 
 `train_transformer.slurm` reads these env vars at submit time so you can
