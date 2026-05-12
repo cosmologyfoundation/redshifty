@@ -484,7 +484,7 @@ The interesting behavior often emerges after a long flat period.
 
 ### Result: A learns, B stays at random
 
-**Approach A** discovered the cross-attention "copy redshift from encoder" pathway at step ~6500 and z_acc climbed steeply from there:
+**Approach A** discovered the cross-attention "copy redshift from encoder" pathway at step ~6500 and z_acc climbed steeply to 69.2% by step 15000:
 
 | step | val_redshift_acc | val_loss_redshift | val_spectrum_acc | val_loss_spectrum |
 |---|---|---|---|---|
@@ -493,36 +493,49 @@ The interesting behavior often emerges after a long flat period.
 | 3000 | 1.5% | 4.81 | 23.6% | 3.07 |
 | 4500 | 1.0% | 4.80 | 25.7% | 2.88 |
 | 5500 | 5.8% | 4.19 | 26.7% | 2.82 |
-| **6500** | **18.4%** | **3.65** | 27.0% | 2.80 |
+| **6500** | **18.4%** | **3.65** | 27.0% | 2.80 ← copy ignites |
 | 8000 | 29.3% | 2.94 | 27.9% | 2.75 |
-| 9000 | 36.7% | 2.61 | 28.2% | 2.73 |
 | 10000 | 42.4% | 2.44 | 28.5% | 2.71 |
-| 11000 | 49.2% | 2.18 | 28.9% | 2.68 |
-| **11500** | **52.4%** | **2.09** | 29.0% | 2.68 |
+| 11500 | 52.4% | 2.09 | 29.0% | 2.68 |
+| 13000 | 57.9% | 1.74 | 29.9% | 2.63 |
+| 14500 | 64.8% | 1.38 | 30.1% | 2.61 |
+| **15000** | **69.2%** | **1.21** | 30.0% | 2.62 ← wallclock cutoff, still climbing |
 
-**Approach B** stayed at noise floor the entire run:
+`loss_redshift` dropped 5.10 → 1.21 over the run — a 76% reduction. `spec_acc` essentially plateaued at ~29-30% (the delayed-copy regime under heavy redshift weighting).
+
+**Approach B** stayed at noise floor for the entire 14000-step run:
 
 | step | val_redshift_acc | val_loss_redshift | val_spectrum_acc | val_loss_spectrum |
 |---|---|---|---|---|
 | 500 | 0.7% | 4.92 | 0.0% | 6.62 |
 | 1500 | 0.3% | 4.77 | 11.2% | 3.70 |
 | 3000 | 1.4% | 4.75 | 20.4% | 3.21 |
-| 4500 | 2.3% | 4.66 | 24.0% | 3.00 |
-| 5500 | 1.3% | 4.75 | 25.8% | 2.91 |
-| 6500 | 0.25% | 4.65 | 26.5% | 2.86 |
-| 8000 | 1.1% | 4.56 | 27.3% | 2.81 |
-| 9500 | 1.8% | 4.60 | 28.2% | 2.76 |
+| 5000 | 1.0% | 4.78 | 24.7% | 2.97 |
+| 7000 | 2.1% | 4.63 | 26.6% | 2.83 |
 | 10000 | 1.2% | 4.53 | 28.3% | 2.74 |
+| 11500 | 2.4% | 4.50 | 28.9% | 2.70 |
+| 13000 | 2.1% | 4.57 | 29.3% | 2.69 |
+| **13500** | 4.1% | 4.53 | 29.3% | 2.68 ← max z_acc, then regresses |
+| 14000 | 0.9% | 4.52 | 29.5% | 2.67 |
 
-B's `loss_redshift` dropped only 4.92 → 4.53 in 10000 steps (A's dropped 5.10 → 2.09). The encoder is not learning to encode redshift into its hidden state from spectrum features.
+B's `loss_redshift` moved only 4.92 → 4.52 (8% reduction) over 14000 steps, with no sustained trend. The single 4.1% z_acc reading at step 13500 collapses to 0.9% at step 14000 — pure noise, not learning. The encoder is not learning to encode redshift into its hidden state from spectrum features.
+
+**Final score:**
+
+| metric | A (step 15000) | B (step 14000) |
+|---|---|---|
+| `val_redshift_acc` | **69.2%** | 0.9% (max 4.1%, noise) |
+| `val_loss_redshift` | **1.21** | 4.52 |
+| `val_spectrum_acc` | 30.0% | 29.5% |
+| `val_loss_spectrum` | 2.62 | 2.67 |
 
 ### Interpretation: the project's thesis answered
 
-The project's hypothesis (from the assignment, addressing the AION-1 critique): **forcing reconstruction of redshift from spectral context every step** (Approach B) should make redshift an organizing principle of the encoder representation. The result, with our 100M model + 10000 training steps + frozen pretrained tokenizer + 395k spectra:
+The project's hypothesis (from the assignment, addressing the AION-1 critique): **forcing reconstruction of redshift from spectral context every step** (Approach B) should make redshift an organizing principle of the encoder representation. The result, with our 100M model + 14000-15000 training steps + frozen pretrained tokenizer + 395k spectra:
 
-**B does not work.** When the encoder doesn't see the redshift token directly, the encoder simply leaves redshift unlearned. The decoder, given no redshift signal in cross-attention context, cannot recover the value, and the position-0 loss term stays near `log(256)/log(e) ≈ 5.5` (random over 256 bins).
+**B does not work.** When the encoder doesn't see the redshift token directly, the encoder simply leaves redshift unlearned. The decoder, given no redshift signal in cross-attention context, cannot recover the value, and the position-0 loss stays near `log(256) / log(e) ≈ 5.55` (random over 256 bins). 14000 steps of training with `redshift_loss_weight=50` (≈ 98% of loss mass at position 0) dropped B's `loss_redshift` from 4.92 only to 4.52. The trajectory is flat; this is not a "needs more compute" problem.
 
-**A trivially succeeds**, but for an uninteresting reason. With the redshift token included in the encoder input, the decoder learns a cross-attention copy pattern that lifts redshift from encoder position 1 to decoder position 0. This is the same trivial-copy phenomenon that inflates `spec_acc` (see Section: "Proof"). It tests neither spectroscopy nor representation learning — only attention-pattern discovery.
+**A succeeds spectacularly — but for an uninteresting reason.** With the redshift token included in the encoder input, the decoder learns a cross-attention copy pattern that lifts redshift from encoder position 1 to decoder position 0. Over the same 15000 steps, A's `val_redshift_acc` climbs from 0.6% to **69.2%** and `loss_redshift` drops from 5.10 to 1.21. The phase transition is sharp — at step 6500 z_acc jumps from 7% to 18% in 500 steps as the copy attention pattern crystallizes. After that, the trajectory is monotone-increasing. This is the same trivial-copy phenomenon that inflates `spec_acc` (see Section: "Proof"); it tests neither spectroscopy nor representation learning — only attention-pattern discovery.
 
 ### Proof: the unweighted runs' 99% spec_acc was trivial copy
 
