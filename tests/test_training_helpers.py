@@ -39,7 +39,7 @@ from src.training.data_split import split_records_by_healpix
 from src.training.eval import evaluate_ar
 from src.training.sequences import tokenize_and_build
 from src.training.utils import compute_masked_metrics
-from src.training.wandb_util import init_wandb
+from src.training.wandb_util import init_wandb, log_model_artifact
 
 
 # ---------------------------------------------------------------------------
@@ -371,3 +371,113 @@ class TestWandbInit:
         )
         assert captured["mode"] == "offline"
         assert os.environ.get("WANDB_MODE") == "offline"
+
+
+# ---------------------------------------------------------------------------
+# log_model_artifact: keep-only-latest prune behaviour
+# ---------------------------------------------------------------------------
+
+class _FakeArt:
+    """Minimal stand-in for wandb.Artifact / ArtifactVersion."""
+    def __init__(self, version: str, aliases=None):
+        self.version = version
+        self.aliases = list(aliases or [])
+        self.name = f"art:{version}"
+        self.deleted = False
+        self.alias_saves = 0
+
+    def add_file(self, path):
+        self.path = path
+
+    def wait(self):
+        return self
+
+    def save(self):
+        self.alias_saves += 1
+
+    def delete(self):
+        self.deleted = True
+
+
+class _FakeRun:
+    def __init__(self, entity="ent", project="proj"):
+        self.entity = entity
+        self.project = project
+        self.logged = []
+
+    def log_artifact(self, art, aliases=None):
+        self.logged.append((art, list(aliases or [])))
+
+
+class TestLogModelArtifactPrune:
+    def _setup_wandb_module(self, monkeypatch, existing_versions, new_version):
+        """Install a fake `wandb` module that returns existing_versions
+        on api.artifact_versions, and constructs new artifacts with new_version."""
+        import types
+
+        new_art = _FakeArt(version=new_version)
+
+        def Artifact(name, type, metadata=None):
+            new_art.config_name = name
+            new_art.type = type
+            new_art.metadata = metadata
+            return new_art
+
+        class _Api:
+            def artifact_versions(self, type_, full_name):
+                return list(existing_versions)
+
+        wb = types.ModuleType("wandb")
+        wb.Artifact = Artifact
+        wb.Api = _Api
+        monkeypatch.setitem(sys.modules, "wandb", wb)
+        return new_art
+
+    def test_run_none_returns_none(self, tmp_path):
+        ckpt = tmp_path / "best.pt"
+        ckpt.write_bytes(b"x")
+        assert log_model_artifact(None, ckpt, "n") is None
+
+    def test_prune_deletes_old_versions(self, tmp_path, monkeypatch):
+        ckpt = tmp_path / "best.pt"
+        ckpt.write_bytes(b"x")
+        old = [_FakeArt("v0"), _FakeArt("v1", aliases=["latest"])]
+        new_art = self._setup_wandb_module(
+            monkeypatch, existing_versions=old + [_FakeArt("v2")], new_version="v2"
+        )
+        run = _FakeRun()
+        result = log_model_artifact(
+            run, ckpt, "approach_a", aliases=["best"], keep_only_latest=True
+        )
+        assert result is new_art
+        # Old v0 and v1 deleted; v2 (current) untouched.
+        assert old[0].deleted is True
+        assert old[1].deleted is True
+        # The aliased "latest" version had its alias stripped before delete.
+        assert old[1].aliases == []
+        assert old[1].alias_saves == 1
+
+    def test_keep_only_latest_false_does_not_prune(self, tmp_path, monkeypatch):
+        ckpt = tmp_path / "best.pt"
+        ckpt.write_bytes(b"x")
+        old = [_FakeArt("v0"), _FakeArt("v1")]
+        self._setup_wandb_module(
+            monkeypatch, existing_versions=old + [_FakeArt("v2")], new_version="v2"
+        )
+        run = _FakeRun()
+        log_model_artifact(
+            run, ckpt, "approach_a", aliases=["best"], keep_only_latest=False
+        )
+        assert old[0].deleted is False
+        assert old[1].deleted is False
+
+    def test_prune_first_upload_no_op(self, tmp_path, monkeypatch):
+        ckpt = tmp_path / "best.pt"
+        ckpt.write_bytes(b"x")
+        new_art = self._setup_wandb_module(
+            monkeypatch, existing_versions=[_FakeArt("v0")], new_version="v0"
+        )
+        run = _FakeRun()
+        result = log_model_artifact(run, ckpt, "approach_a", keep_only_latest=True)
+        assert result is new_art
+        # The only existing version equals keep_version → nothing deleted.

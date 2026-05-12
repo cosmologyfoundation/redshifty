@@ -114,14 +114,9 @@ def log_model_artifact(
     name: str,
     aliases=None,
     metadata=None,
+    keep_only_latest: bool = True,
 ):
     """Upload a checkpoint to wandb as a model artifact.
-
-    Use sparingly — wandb has storage limits, so prefer slim model-only
-    checkpoints (no optim/scaler state). For the redshifty project,
-    best.pt with full optim state is ~300 MB; a slim model-only version
-    is ~100 MB. Recommended pattern: write a slim copy alongside best.pt
-    and log THAT.
 
     Args:
         run: wandb run from init_wandb (or None — no-op).
@@ -131,6 +126,10 @@ def log_model_artifact(
         aliases: list of human-readable aliases to attach
             (e.g. ["best", "step_12000"]).
         metadata: optional dict of key=value pairs to attach.
+        keep_only_latest: if True (default), delete prior versions of
+            this artifact after the new upload succeeds. Saves wandb
+            storage when log_model_artifact is called on every
+            best-val improvement. Set False to retain history.
 
     Returns:
         wandb.Artifact or None.
@@ -150,7 +149,42 @@ def log_model_artifact(
         art.add_file(str(ckpt_path))
         run.log_artifact(art, aliases=aliases or [])
         print(f"[wandb] logged artifact {name} <- {ckpt_path}")
-        return art
     except Exception as e:
         print(f"[wandb] artifact upload failed ({e!r})")
         return None
+
+    if keep_only_latest:
+        try:
+            art.wait()
+            _prune_old_artifact_versions(run, name, keep_version=art.version)
+        except Exception as e:
+            print(f"[wandb] artifact prune skipped ({e!r})")
+
+    return art
+
+
+def _prune_old_artifact_versions(run, name: str, keep_version: str):
+    """Delete all versions of <run.entity>/<run.project>/<name> except
+    keep_version. Strips protected aliases (e.g. 'latest') before deleting
+    since wandb refuses to delete an aliased version otherwise.
+    """
+    try:
+        import wandb
+    except ImportError:
+        return
+    api = wandb.Api()
+    full_name = f"{run.entity}/{run.project}/{name}"
+    deleted = 0
+    for v in api.artifact_versions("model", full_name):
+        if v.version == keep_version:
+            continue
+        try:
+            if v.aliases:
+                v.aliases = []
+                v.save()
+            v.delete()
+            deleted += 1
+        except Exception as e:
+            print(f"[wandb] could not delete {v.name}: {e!r}")
+    if deleted:
+        print(f"[wandb] pruned {deleted} old version(s) of {name}, kept {keep_version}")

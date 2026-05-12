@@ -214,6 +214,14 @@ has a cell for this. Set `ARTIFACT_URI = None` to fall back to a local
 Disable artifact upload with `--no-push-wandb-artifact` (e.g. for sweep
 runs where you don't want to flood storage).
 
+**Auto-pruning of old versions.** `log_model_artifact()` defaults to
+`keep_only_latest=True`: after each successful upload it deletes prior
+versions of the same artifact (stripping any protected aliases like
+`latest` first). So a run that improves val-loss 10 times will only
+have *one* `:vN` version in wandb at the end — the best one — and your
+project storage stays small. Set `keep_only_latest=False` if you want
+the full version history.
+
 ## Staging DR1 from CFS to SCRATCH (for I/O speedup)
 
 `$CFS` is *not tuned* for the random small-file FITS reads that
