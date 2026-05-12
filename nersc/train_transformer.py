@@ -161,9 +161,14 @@ def main():
         os.environ["WORLD_SIZE"] = str(world_size)
         os.environ.setdefault("MASTER_ADDR", "localhost")
         os.environ.setdefault("MASTER_PORT", "29500")
-        torch.cuda.set_device(local_rank)
+        # When srun uses --gpus-per-task=N, each task sees only its
+        # bound GPU(s) as cuda:0.., so local_rank may exceed device_count.
+        # When all GPUs are visible to every task, local_rank is the
+        # actual device index. Pick whichever applies.
+        cuda_idx = local_rank if local_rank < torch.cuda.device_count() else 0
+        torch.cuda.set_device(cuda_idx)
         dist.init_process_group(backend="nccl")
-        device = torch.device(f"cuda:{local_rank}")
+        device = torch.device(f"cuda:{cuda_idx}")
     else:
         rank, world_size, local_rank = 0, 1, 0
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -252,7 +257,7 @@ def main():
         dropout=args.dropout,
     ).to(device)
     if is_distributed:
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+        model = DDP(model, device_ids=[device.index], find_unused_parameters=False)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[model] params={n_params:,} (~{n_params/1e6:.1f}M)")
 
