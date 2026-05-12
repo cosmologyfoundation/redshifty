@@ -213,7 +213,7 @@ def main():
     # Model
     model = SpectrumTokenizer().to(device)
     if is_distributed:
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+        model = DDP(model, device_ids=[0], find_unused_parameters=False)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[model] params={n_params:,} (~{n_params/1e6:.1f}M)")
 
