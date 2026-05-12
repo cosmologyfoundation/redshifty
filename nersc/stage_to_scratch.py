@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 Stage a DR1 manifest's healpix files from $CFS to $SCRATCH.
 

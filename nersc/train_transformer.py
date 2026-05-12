@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 Train SpectrumTransformer on DR1 with a pretrained tokenizer.
 

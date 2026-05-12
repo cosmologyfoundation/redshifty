@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 Build a manifest index of DESI DR1 healpix coadds for streaming.
 
