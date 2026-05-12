@@ -151,12 +151,17 @@ def main():
 
     is_distributed = "RANK" in os.environ
     if is_distributed:
+        local_rank = int(os.environ["LOCAL_RANK"])
+        # Pin each process to its GPU BEFORE any CUDA work (including NCCL init).
+        # srun --gpu-bind sets CUDA_VISIBLE_DEVICES automatically; if not set,
+        # we set it ourselves so each process sees exactly one GPU at index 0.
+        if "CUDA_VISIBLE_DEVICES" not in os.environ:
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(local_rank)
         dist.init_process_group(backend="nccl")
         rank = dist.get_rank()
         world_size = dist.get_world_size()
-        local_rank = int(os.environ["LOCAL_RANK"])
-        torch.cuda.set_device(local_rank)
-        device = torch.device(f"cuda:{local_rank}")
+        torch.cuda.set_device(0)
+        device = torch.device("cuda:0")
     else:
         rank, world_size, local_rank = 0, 1, 0
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
