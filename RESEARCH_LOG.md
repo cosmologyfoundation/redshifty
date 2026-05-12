@@ -287,3 +287,183 @@ sbatch nersc/pretrain_tokenizer.slurm  # 24h, ~hundreds of thousands of spectra
   `d_model=768, n_layers=6` on full DR1 (sv3 + main, bright + dark).
 - Phase 10: OOD generalization on non-DESI spectra (assignment
   requirement).
+
+---
+
+## 2026-05-08: Phase 8 Result — Tokenizer Pretrain
+
+### Trial run (job 52693687)
+
+- 200 healpix files (sv3+bright), 393967 row index → 200-spectrum cap.
+- 20k steps, batch 32, single A100 in `shared` QOS, 5h18min wallclock.
+- I/O bound: 1.05 step/s × batch 32 = 34 spec/s — well below A100's
+  ~200-500 spec/s for this 24M-param model. CFS FITS-read bandwidth is
+  the bottleneck.
+
+### Loss curve
+
+| step | val_recon | val_total | val_quant |
+|---|---|---|---|
+| 500 | 6.63 | 6.68 | 0.05 |
+| 2000 | 2.46 | 2.68 | 0.22 |
+| 5000 | 1.73 | 2.04 | 0.31 |
+| 12500 | 1.43 | 1.74 | 0.31 |
+| **16500** | **1.35** | **1.69** | 0.34 ← best |
+| 19500 | 1.34 | 1.79 | 0.45 |
+
+Smooth descent to a clear plateau by ~step 14000. `quant_loss` climbing
+from 0.05 → 0.4 is expected — the codebook starts being used (initial
+collapse → diversified codes).
+
+**Outcome:** `best.pt` at step 16500 is a real tokenizer. Used as the
+frozen tokenizer for all subsequent transformer experiments.
+
+### Performance opportunities (not pursued yet)
+
+- Staging healpix files from CFS → SCRATCH before training: ~5-10×
+  step-rate speedup (CFS read is the dominant cost).
+- DDP across 4 GPUs in `regular` QOS: ~3-3.5× wallclock speedup, but
+  also 4× allocation cost — only worth it after staging fixes I/O.
+- 24h budget needs ~1.2 step/s for 100k steps; we got 0.23 step/s at
+  100M-param transformer scale (next phase).
+
+---
+
+## 2026-05-11: Phase 9 Trial — Transformer with Frozen Pretrained Tokenizer
+
+### Pre-fix runs (jobs 52827566 / 52827575, no redshift weighting)
+
+Both Approach A and B at full scale (`d_model=768`, 6 layers, 100M params,
+batch 8, AMP). 200 healpix, 393967 spectra, val_frac=0.02. 20k step
+budget; jobs hit the 6h wallclock at step ~9000.
+
+| step | A spec_acc | B spec_acc | A z_acc | B z_acc |
+|---|---|---|---|---|
+| 1500 | 38.8% | 39.6% | 2.4% | 0.7% |
+| 5000 | 47.2% | 45.5% | 1.3% | 1.3% |
+| 6000 | 55.7% | 65.1% | 3.0% | 0.0% |
+| 7000 | 88.4% | **98.8%** | 3.2% | 2.7% |
+| 9000 | **97.2%** | **99.91%** | 4.1% | 2.0% |
+
+**Major discovery: spec_acc → 99% is the model learning a trivial
+cross-attention copy, not real spectrum modeling.**
+
+For Approach B, decoder at position `j` (`j≥1`) predicts spectrum
+token `s_j`. The encoder is `[SOS, s1, ..., sN, EOS]` and cross-attention
+is unmasked. The model learns to attend from decoder position `j` to
+encoder position `j` — an off-by-one shift, pure copy. No spectroscopy
+involved. The step 5500→7000 explosion (50% → 99%) is when this attention
+pattern is discovered.
+
+For Approach A, encoder is `[SOS, redshift, s1, ..., sN, EOS]`, off-by-two
+shift, slightly harder but same trick. Hence A's 97% ceiling vs B's 99.9%.
+
+**Critically, `z_acc` stayed at random (~2-4%) the whole time.** Reason:
+cross-entropy averaged over 274 sequence positions, redshift contributes
+1/274 ≈ 0.4% of gradient signal. The model has zero incentive to learn
+position 0, so it never does.
+
+**Conclusion:** the unweighted runs don't test the project's thesis.
+Both Approach A and B degenerate into the same trivial copy-from-encoder
+behavior, and neither learns redshift. We need to force position 0 to
+matter.
+
+### Fix 1: Redshift loss weighting
+
+`forward()` now accepts `redshift_weight: float = 1.0` and splits the
+cross-entropy by position:
+```
+loss = redshift_weight * loss_redshift_mean + loss_spectrum_mean
+```
+At `--redshift-loss-weight 50` (current default), redshift's aggregate
+gradient share is 50:1 vs spectrum (~98% of total loss mass at position 0).
+
+`compute_loss_breakdown` helper added to `src/training/utils.py` to log
+unweighted per-segment losses separately — visible in `metrics.jsonl`
+and wandb so we can tell whether the redshift term is actually
+descending.
+
+### Fix 2: Weights & Biases integration
+
+`nersc/_wandb_util.py` provides `init_wandb` / `wlog` / `wfinish`
+helpers used by both `pretrain_tokenizer.py` and `train_transformer.py`.
+Reads `WANDB_API_KEY` from `.env` (gitignored) via `python-dotenv`.
+Modes: online / offline / disabled. NERSC compute nodes default to
+offline; metrics are written locally and uploaded later from a login
+node with `wandb sync`.
+
+### Weighted run (jobs 52840231 / 52840234, redshift_weight=50)
+
+Same data, same model size, weight=50. First impression at step 1500
+looked like the weighting was starving spectrum learning (15% spec_acc
+vs the unweighted run's 38.8% at the same step). But the full
+trajectory tells a different story:
+
+**Approach A:**
+
+| step | spec_acc | z_acc | loss_redshift |
+|---|---|---|---|
+| 1500 | 15.6% | 1.5% | 4.90 |
+| 3000 | 23.6% | 1.5% | 4.81 |
+| 4500 | 25.7% | 1.0% | 4.80 |
+| 5000 | 26.4% | 3.1% | 4.65 |
+| **5500** | **26.7%** | **5.8%** | **4.19** ← cross-attention copy discovered |
+
+**Approach B:**
+
+| step | spec_acc | z_acc | loss_redshift |
+|---|---|---|---|
+| 1500 | 11.2% | 0.3% | 4.77 |
+| 3000 | 20.4% | 1.4% | 4.75 |
+| 4000 | 22.8% | 2.95% | 4.70 |
+
+Between step 4500 and 5500, A's z_acc jumped 1% → 5.8% and
+`loss_redshift` dropped from 4.80 → 4.19 — the first real descent since
+warmup. This is the model finally discovering the cross-attention
+redshift pathway (for A it's a copy; for B it has to extract from
+spectrum encoding).
+
+### Why initial diagnosis was wrong
+
+At step 1500 the weighted run looked worse on every axis. The temptation
+was to lower the weight immediately. But the model needs time to discover
+the cross-attention copy for redshift (~5000 steps with weight=50). The
+unweighted run hit 50% spec_acc fast because the spectrum copy is easier
+to discover than the redshift one — partly because redshift gets so
+little gradient.
+
+Lesson: don't kill a run during the "boring middle" phase of training.
+The interesting behavior often emerges after a long flat period.
+
+### Open questions / next moves
+
+1. **How high does the weighted run's `z_acc` go?** A's 5.8% at step 5500
+   should keep climbing fast (it's a copy task). B's progression is the
+   real test — does the encoder actually encode redshift into its
+   hidden state from spectrum alone?
+
+2. **Does the weighted run also reach >90% `spec_acc` eventually?**
+   Or does the heavy redshift focus permanently slow spectrum learning?
+
+3. **Is weight=50 the right value?** Could try `weight ∈ {5, 10, 20}`
+   if z_acc plateaus too low or spec_acc stays starved.
+
+4. **Held-out healpix split.** Current val set is random rows from the
+   same healpix files as train. For honest generalization we should
+   hold out entire healpix files.
+
+5. **Top-hat 5-pixel convolution as tokenizer preprocessing.** Still on
+   the backlog; would smooth pixel noise the LFQ codebook is spending
+   capacity on.
+
+### Files touched this phase
+
+- `src/models/transformer.py` — `redshift_weight` kwarg + position-split loss
+- `src/training/utils.py` — `compute_loss_breakdown` helper
+- `nersc/_wandb_util.py` (new) — wandb init/log/finish helpers
+- `nersc/train_transformer.py` — flags, threading, breakdown + wandb logging
+- `nersc/pretrain_tokenizer.py` — wandb logging
+- `nersc/dr1_dataset.py`, `nersc/dr1_tokenized_dataset.py` — manifest-based DR1 loaders
+- `nersc/train_transformer.slurm`, `nersc/smoke_transformer.slurm` — SLURM entry points
+- `requirements.txt`, `pyproject.toml`, `nersc/setup_env.sh` — `python-dotenv` added
+- `nersc/README.md` — wandb + weighting documentation
