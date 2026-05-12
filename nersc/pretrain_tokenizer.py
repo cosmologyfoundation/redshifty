@@ -28,7 +28,10 @@ import time
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Subset
+from torch.utils.data.distributed import DistributedSampler
 
 # Repo imports
 HERE = Path(__file__).resolve().parent
@@ -133,8 +136,19 @@ def main():
         args.num_workers = 0
 
     # Setup
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[setup] device={device} amp={args.amp} steps={args.steps}")
+    is_distributed = "RANK" in os.environ
+    if is_distributed:
+        dist.init_process_group(backend="nccl")
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        rank, world_size, local_rank = 0, 1, 0
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    print(f"[setup] rank={rank}/{world_size} device={device} amp={args.amp} steps={args.steps}")
     print(f"[setup] scratch_out={args.scratch_out}")
 
     run_dir = args.scratch_out / args.run_name
@@ -168,10 +182,12 @@ def main():
     val_ds = Subset(full, val_idx)
     print(f"[data] train={len(train_ds)} val={len(val_ds)}")
 
+    train_sampler = DistributedSampler(train_ds, shuffle=True) if is_distributed else None
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=args.num_workers,
         collate_fn=collate_dr1_skip_none,
         pin_memory=device.type == "cuda",
@@ -189,6 +205,8 @@ def main():
 
     # Model
     model = SpectrumTokenizer().to(device)
+    if is_distributed:
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[model] params={n_params:,} (~{n_params/1e6:.1f}M)")
 
@@ -221,6 +239,8 @@ def main():
     t_start = time.time()
     train_iter = iter(train_loader)
     model.train()
+    if train_sampler is not None:
+        train_sampler.set_epoch(0)
 
     while step < args.steps:
         try:
@@ -251,7 +271,7 @@ def main():
         scaler.step(optim)
         scaler.update()
 
-        if step % args.log_every == 0:
+        if rank == 0 and step % args.log_every == 0:
             dt = time.time() - t_start
             rate = (step + 1) / max(dt, 1e-6)
             msg = {
@@ -280,7 +300,7 @@ def main():
                 "train/steps_per_sec": rate,
             }, step=step)
 
-        if step > 0 and step % args.val_every == 0:
+        if rank == 0 and step > 0 and step % args.val_every == 0:
             val_losses = evaluate(model, val_loader, device, args.amp)
             model.train()
             msg = {"kind": "val", "step": step, **{f"val_{k}": v for k, v in val_losses.items()}}
@@ -293,7 +313,7 @@ def main():
                 best_val = val_losses["total"]
                 ckpt = {
                     "step": step,
-                    "model": model.state_dict(),
+                    "model": model.module.state_dict() if is_distributed else model.state_dict(),
                     "optim": optim.state_dict(),
                     "scaler": scaler.state_dict(),
                     "val_loss": best_val,
@@ -310,27 +330,36 @@ def main():
                         print(f"  WARN: cfs_out mirror failed ({e}); "
                               f"SCRATCH best.pt is safe at {p}")
 
-        if step > 0 and step % args.save_every == 0:
+        if rank == 0 and step > 0 and step % args.save_every == 0:
             p = run_dir / f"step_{step:08d}.pt"
-            torch.save({"step": step, "model": model.state_dict()}, p)
+            torch.save({
+                "step": step,
+                "model": model.module.state_dict() if is_distributed else model.state_dict(),
+            }, p)
             print(f"  ckpt -> {p}")
 
         step += 1
 
-    # Final
-    p = run_dir / "final.pt"
-    torch.save({"step": step, "model": model.state_dict()}, p)
-    print(f"[done] final -> {p}")
-    if args.cfs_out is not None:
-        try:
-            args.cfs_out.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(p, args.cfs_out / "final.pt")
-            print(f"[done] mirrored final -> {args.cfs_out / 'final.pt'}")
-        except OSError as e:
-            print(f"  WARN: cfs_out final mirror failed ({e}); "
-                  f"SCRATCH final.pt is safe at {p}")
-    print(f"[done] best val_loss={best_val:.4f}")
-    wfinish(wandb_run)
+    if rank == 0:
+        p = run_dir / "final.pt"
+        torch.save({
+            "step": step,
+            "model": model.module.state_dict() if is_distributed else model.state_dict(),
+        }, p)
+        print(f"[done] final -> {p}")
+        if args.cfs_out is not None:
+            try:
+                args.cfs_out.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(p, args.cfs_out / "final.pt")
+                print(f"[done] mirrored final -> {args.cfs_out / 'final.pt'}")
+            except OSError as e:
+                print(f"  WARN: cfs_out final mirror failed ({e}); "
+                      f"SCRATCH final.pt is safe at {p}")
+        print(f"[done] best val_loss={best_val:.4f}")
+        wfinish(wandb_run)
+
+    if is_distributed:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

@@ -34,7 +34,10 @@ import time
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
@@ -146,9 +149,21 @@ def main():
         args.z_fit_files = min(args.z_fit_files, 5)
         args.ar_eval_batches = 1
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[setup] device={device} approach={args.approach} steps={args.steps} "
-          f"mask_ratio={args.encoder_mask_ratio} redshift_weight={args.redshift_loss_weight}")
+    is_distributed = "RANK" in os.environ
+    if is_distributed:
+        dist.init_process_group(backend="nccl")
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        rank, world_size, local_rank = 0, 1, 0
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    print(f"[setup] rank={rank}/{world_size} device={device} approach={args.approach} "
+          f"steps={args.steps} mask_ratio={args.encoder_mask_ratio} "
+          f"redshift_weight={args.redshift_loss_weight}")
     run_dir = args.scratch_out / "checkpoints" / args.run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = run_dir / "metrics.jsonl"
@@ -200,10 +215,12 @@ def main():
     )
     print(f"[data] train_ds={len(train_ds)} val_ds={len(val_ds)}")
 
+    train_sampler = DistributedSampler(train_ds, shuffle=True) if is_distributed else None
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=args.num_workers,
         collate_fn=collate_dr1_skip_none,
         pin_memory=device.type == "cuda",
@@ -227,6 +244,8 @@ def main():
         n_heads=args.n_heads,
         dropout=args.dropout,
     ).to(device)
+    if is_distributed:
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[model] params={n_params:,} (~{n_params/1e6:.1f}M)")
 
@@ -257,6 +276,8 @@ def main():
     t0 = time.time()
     train_iter = iter(train_loader)
     model.train()
+    if train_sampler is not None:
+        train_sampler.set_epoch(0)
 
     while step < args.steps:
         try:
@@ -286,7 +307,7 @@ def main():
         scaler.step(optim)
         scaler.update()
 
-        if step % args.log_every == 0:
+        if rank == 0 and step % args.log_every == 0:
             with torch.no_grad():
                 m = compute_metrics(logits, tgt)
                 b = compute_loss_breakdown(logits, tgt)
@@ -323,7 +344,7 @@ def main():
                 "train/steps_per_sec": rate,
             }, step=step)
 
-        if step > 0 and step % args.val_every == 0:
+        if rank == 0 and step > 0 and step % args.val_every == 0:
             v = evaluate(
                 model, val_loader, spec_tok, z_tok, args.approach, device,
                 args.amp, args.redshift_loss_weight,
@@ -340,14 +361,10 @@ def main():
                 p = run_dir / "best.pt"
                 torch.save({
                     "step": step,
-                    "model": model.state_dict(),
+                    "model": model.module.state_dict() if is_distributed else model.state_dict(),
                     "optim": optim.state_dict(),
                     "scaler": scaler.state_dict(),
                     "val_loss": best_val,
-                    # State for downstream visualization / inference. Travels
-                    # with the .pt so a notebook can decode redshift bins
-                    # back to z values without re-fitting on a sample that
-                    # may not match the training distribution.
                     "z_tokenizer": {
                         "sorted_z": z_tok._sorted_z.cpu(),
                         "n_levels": z_tok.n_levels,
@@ -366,10 +383,6 @@ def main():
                         print(f"  WARN: cfs_out mirror failed ({e}); "
                               f"SCRATCH best.pt is safe at {p}")
 
-                # Push the FULL best.pt (incl. optim/scaler state) to
-                # wandb as an Artifact. We have headroom on the wandb
-                # storage budget and a full ckpt lets us resume training
-                # from a wandb pull, not just visualize.
                 if args.push_wandb_artifact and wandb_run is not None:
                     log_model_artifact(
                         wandb_run, p,
@@ -385,7 +398,6 @@ def main():
                         },
                     )
 
-                # AR eval on the new best (cheap-ish).
                 ar = evaluate_ar(
                     model, val_loader, spec_tok, z_tok, args.approach, device,
                     max_batches=args.ar_eval_batches,
@@ -398,57 +410,62 @@ def main():
                                         **{f"val_ar_{k}": vv for k, vv in ar.items()}}) + "\n")
                 wlog(wandb_run, {f"val_ar/{k}": vv for k, vv in ar.items()}, step=step)
 
-        if step > 0 and step % args.save_every == 0:
+        if rank == 0 and step > 0 and step % args.save_every == 0:
             p = run_dir / f"step_{step:08d}.pt"
-            torch.save({"step": step, "model": model.state_dict()}, p)
+            torch.save({
+                "step": step,
+                "model": model.module.state_dict() if is_distributed else model.state_dict(),
+            }, p)
             print(f"  ckpt -> {p}")
 
         step += 1
 
-    # Final
-    p = run_dir / "final.pt"
-    torch.save({
-        "step": step,
-        "model": model.state_dict(),
-        "z_tokenizer": {
-            "sorted_z": z_tok._sorted_z.cpu(),
-            "n_levels": z_tok.n_levels,
-            "gaussian_range": z_tok.gaussian_range,
-        },
-        "tokenizer_ckpt_path": str(args.tokenizer_ckpt),
-        "approach": args.approach,
-        "encoder_mask_ratio": args.encoder_mask_ratio,
-    }, p)
-    print(f"[done] final -> {p}  best_val_loss={best_val:.4f}")
-    if args.cfs_out is not None:
-        try:
-            args.cfs_out.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(p, args.cfs_out / "final.pt")
-        except OSError as e:
-            print(f"  WARN: cfs_out final mirror failed ({e}); "
-                  f"SCRATCH final.pt is safe at {p}")
+    if rank == 0:
+        p = run_dir / "final.pt"
+        torch.save({
+            "step": step,
+            "model": model.module.state_dict() if is_distributed else model.state_dict(),
+            "z_tokenizer": {
+                "sorted_z": z_tok._sorted_z.cpu(),
+                "n_levels": z_tok.n_levels,
+                "gaussian_range": z_tok.gaussian_range,
+            },
+            "tokenizer_ckpt_path": str(args.tokenizer_ckpt),
+            "approach": args.approach,
+            "encoder_mask_ratio": args.encoder_mask_ratio,
+        }, p)
+        print(f"[done] final -> {p}  best_val_loss={best_val:.4f}")
+        if args.cfs_out is not None:
+            try:
+                args.cfs_out.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(p, args.cfs_out / "final.pt")
+            except OSError as e:
+                print(f"  WARN: cfs_out final mirror failed ({e}); "
+                      f"SCRATCH final.pt is safe at {p}")
 
-    if args.push_wandb_artifact and wandb_run is not None:
-        log_model_artifact(
-            wandb_run, p,
-            name=f"approach_{args.approach}_{args.run_name}",
-            aliases=["final", f"step_{step}"],
-            metadata={"step": step, "approach": args.approach},
+        if args.push_wandb_artifact and wandb_run is not None:
+            log_model_artifact(
+                wandb_run, p,
+                name=f"approach_{args.approach}_{args.run_name}",
+                aliases=["final", f"step_{step}"],
+                metadata={"step": step, "approach": args.approach},
+            )
+
+        ar_final = evaluate_ar(
+            model, val_loader, spec_tok, z_tok, args.approach, device,
+            max_batches=args.ar_eval_batches,
+            encoder_mask_ratio=args.encoder_mask_ratio,
         )
+        print(f"[ar_final {step:6d}] " + " ".join(f"{k}={ar_final[k]}" for k in ar_final))
+        with metrics_path.open("a") as f:
+            f.write(json.dumps({"kind": "ar_final", "step": step,
+                                **{f"val_ar_{k}": vv for k, vv in ar_final.items()}}) + "\n")
+        wlog(wandb_run, {f"val_ar/{k}": vv for k, vv in ar_final.items()}, step=step)
 
-    # AR eval on final.
-    ar_final = evaluate_ar(
-        model, val_loader, spec_tok, z_tok, args.approach, device,
-        max_batches=args.ar_eval_batches,
-        encoder_mask_ratio=args.encoder_mask_ratio,
-    )
-    print(f"[ar_final {step:6d}] " + " ".join(f"{k}={ar_final[k]}" for k in ar_final))
-    with metrics_path.open("a") as f:
-        f.write(json.dumps({"kind": "ar_final", "step": step,
-                            **{f"val_ar_{k}": vv for k, vv in ar_final.items()}}) + "\n")
-    wlog(wandb_run, {f"val_ar/{k}": vv for k, vv in ar_final.items()}, step=step)
+        wfinish(wandb_run)
 
-    wfinish(wandb_run)
+    if is_distributed:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
