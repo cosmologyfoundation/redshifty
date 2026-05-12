@@ -149,17 +149,17 @@ def main():
         args.z_fit_files = min(args.z_fit_files, 5)
         args.ar_eval_batches = 1
 
-    is_distributed = "RANK" in os.environ
+    # Detect DDP: either explicit RANK env var (from SLURM script exports)
+    # or SLURM's native SLURM_PROCID (from interactive srun).
+    is_distributed = "RANK" in os.environ or "SLURM_PROCID" in os.environ
     if is_distributed:
-        local_rank = int(os.environ["LOCAL_RANK"])
+        local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_LOCALID", "0")))
+        rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", "0")))
+        world_size = int(os.environ.get("WORLD_SIZE", os.environ.get("SLURM_NTASKS", "1")))
         # Pin each process to its GPU BEFORE any CUDA work (including NCCL init).
-        # srun --gpu-bind sets CUDA_VISIBLE_DEVICES automatically; if not set,
-        # we set it ourselves so each process sees exactly one GPU at index 0.
         if "CUDA_VISIBLE_DEVICES" not in os.environ:
             os.environ["CUDA_VISIBLE_DEVICES"] = str(local_rank)
         dist.init_process_group(backend="nccl")
-        rank = dist.get_rank()
-        world_size = dist.get_world_size()
         torch.cuda.set_device(0)
         device = torch.device("cuda:0")
     else:
