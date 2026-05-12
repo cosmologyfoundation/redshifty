@@ -34,7 +34,7 @@ MAX_HEALPIX="${MAX_HEALPIX:-10000}"
 STEPS="${STEPS:-200000}"
 BATCH_SIZE="${BATCH_SIZE:-32}"
 LR="${LR:-1.2e-3}"
-NUM_WORKERS="${NUM_WORKERS:-8}"
+NUM_WORKERS="${NUM_WORKERS:-12}"
 # -------------------------------------
 
 MANIFEST="${MANIFEST:-$SCRATCH_OUT/manifests/dr1_${MAX_HEALPIX}.jsonl}"
