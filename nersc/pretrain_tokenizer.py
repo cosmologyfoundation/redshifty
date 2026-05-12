@@ -37,7 +37,7 @@ from torch.utils.data.distributed import DistributedSampler
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 from src.tokenizers.spectrum import SpectrumTokenizer  # noqa: E402
-from src.training.wandb_util import init_wandb, wfinish, wlog  # noqa: E402
+from src.training.wandb_util import init_wandb, log_model_artifact, wfinish, wlog  # noqa: E402
 
 # Local imports
 sys.path.insert(0, str(HERE))
@@ -84,6 +84,11 @@ def parse_args():
     p.add_argument("--wandb-mode", choices=["online", "offline", "disabled"],
                    default="online")
     p.add_argument("--wandb-project", type=str, default="redshifty")
+    p.add_argument("--push-wandb-artifact", action="store_true", default=True,
+                   help="Upload best.pt to wandb as an Artifact on each best "
+                        "update (and final). Disable with --no-push-wandb-artifact.")
+    p.add_argument("--no-push-wandb-artifact", action="store_false",
+                   dest="push_wandb_artifact")
 
     # Smoke test toggle
     p.add_argument("--smoke", action="store_true",
@@ -349,6 +354,18 @@ def main():
                         print(f"  WARN: cfs_out mirror failed ({e}); "
                               f"SCRATCH best.pt is safe at {p}")
 
+                if args.push_wandb_artifact and wandb_run is not None:
+                    log_model_artifact(
+                        wandb_run, p,
+                        name=f"tokenizer_{args.run_name}",
+                        aliases=["best", f"step_{step}"],
+                        metadata={
+                            "val_loss": best_val,
+                            "step": step,
+                            "full_state": True,
+                        },
+                    )
+
         if rank == 0 and step > 0 and step % args.save_every == 0:
             p = run_dir / f"step_{step:08d}.pt"
             torch.save({
@@ -375,6 +392,15 @@ def main():
                 print(f"  WARN: cfs_out final mirror failed ({e}); "
                       f"SCRATCH final.pt is safe at {p}")
         print(f"[done] best val_loss={best_val:.4f}")
+
+        if args.push_wandb_artifact and wandb_run is not None:
+            log_model_artifact(
+                wandb_run, p,
+                name=f"tokenizer_{args.run_name}",
+                aliases=["final", f"step_{step}"],
+                metadata={"step": step},
+            )
+
         wfinish(wandb_run)
 
     if is_distributed:
