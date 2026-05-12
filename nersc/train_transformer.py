@@ -252,24 +252,26 @@ def main():
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp)
 
-    # Wandb init
-    wandb_config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
-    wandb_config.update({
-        "n_params": n_params,
-        "n_train": len(train_ds),
-        "n_val": len(val_ds),
-        "n_manifest_records": len(records),
-        "n_train_records": len(train_records),
-        "n_val_records": len(val_records),
-    })
-    wandb_dir = args.scratch_out / "wandb" / args.run_name
-    wandb_run = init_wandb(
-        mode=args.wandb_mode,
-        project=args.wandb_project,
-        run_name=args.run_name,
-        config=wandb_config,
-        out_dir=wandb_dir,
-    )
+    # Wandb init — rank 0 only
+    wandb_run = None
+    if rank == 0:
+        wandb_config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
+        wandb_config.update({
+            "n_params": n_params,
+            "n_train": len(train_ds),
+            "n_val": len(val_ds),
+            "n_manifest_records": len(records),
+            "n_train_records": len(train_records),
+            "n_val_records": len(val_records),
+        })
+        wandb_dir = args.scratch_out / "wandb" / args.run_name
+        wandb_run = init_wandb(
+            mode=args.wandb_mode,
+            project=args.wandb_project,
+            run_name=args.run_name,
+            config=wandb_config,
+            out_dir=wandb_dir,
+        )
 
     step = 0
     best_val = float("inf")
