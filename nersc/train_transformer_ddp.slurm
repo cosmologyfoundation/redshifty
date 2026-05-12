@@ -83,6 +83,17 @@ if [ ! -s "$MANIFEST" ]; then
         --out "$MANIFEST"
 fi
 
+# Translate SLURM vars -> PyTorch DDP env vars
+export RANK=${SLURM_PROCID}
+export LOCAL_RANK=${SLURM_LOCALID}
+export WORLD_SIZE=${SLURM_NTASKS}
+export MASTER_PORT=$(( 29500 + (SLURM_JOB_ID % 1000) ))
+export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)
+
+# NCCL knobs for Slingshot-11
+export NCCL_NET_GDR_LEVEL=PHB
+export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
+
 srun python "$REPO/nersc/train_transformer.py" \
     --manifest "$MANIFEST" \
     --tokenizer-ckpt "$TOKENIZER_CKPT" \
