@@ -161,12 +161,9 @@ def main():
         os.environ["WORLD_SIZE"] = str(world_size)
         os.environ.setdefault("MASTER_ADDR", "localhost")
         os.environ.setdefault("MASTER_PORT", "29500")
-        # Pin each process to its GPU BEFORE any CUDA work (including NCCL init).
-        if "CUDA_VISIBLE_DEVICES" not in os.environ:
-            os.environ["CUDA_VISIBLE_DEVICES"] = str(local_rank)
+        torch.cuda.set_device(local_rank)
         dist.init_process_group(backend="nccl")
-        torch.cuda.set_device(0)
-        device = torch.device("cuda:0")
+        device = torch.device(f"cuda:{local_rank}")
     else:
         rank, world_size, local_rank = 0, 1, 0
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -255,7 +252,7 @@ def main():
         dropout=args.dropout,
     ).to(device)
     if is_distributed:
-        model = DDP(model, device_ids=[0], find_unused_parameters=False)
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[model] params={n_params:,} (~{n_params/1e6:.1f}M)")
 
