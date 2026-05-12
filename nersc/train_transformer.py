@@ -281,17 +281,21 @@ def main():
         )
 
     step = 0
+    epoch = 0
     best_val = float("inf")
     t0 = time.time()
+    if train_sampler is not None:
+        train_sampler.set_epoch(epoch)
     train_iter = iter(train_loader)
     model.train()
-    if train_sampler is not None:
-        train_sampler.set_epoch(0)
 
     while step < args.steps:
         try:
             raw = next(train_iter)
         except StopIteration:
+            epoch += 1
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
             train_iter = iter(train_loader)
             raw = next(train_iter)
         if raw is None:
@@ -355,7 +359,8 @@ def main():
 
         if rank == 0 and step > 0 and step % args.val_every == 0:
             v = evaluate(
-                model, val_loader, spec_tok, z_tok, args.approach, device,
+                model.module if is_distributed else model,
+                val_loader, spec_tok, z_tok, args.approach, device,
                 args.amp, args.redshift_loss_weight,
                 encoder_mask_ratio=args.encoder_mask_ratio,
             )
@@ -408,7 +413,8 @@ def main():
                     )
 
                 ar = evaluate_ar(
-                    model, val_loader, spec_tok, z_tok, args.approach, device,
+                    model.module if is_distributed else model,
+                    val_loader, spec_tok, z_tok, args.approach, device,
                     max_batches=args.ar_eval_batches,
                     encoder_mask_ratio=args.encoder_mask_ratio,
                 )
@@ -461,7 +467,8 @@ def main():
             )
 
         ar_final = evaluate_ar(
-            model, val_loader, spec_tok, z_tok, args.approach, device,
+            model.module if is_distributed else model,
+            val_loader, spec_tok, z_tok, args.approach, device,
             max_batches=args.ar_eval_batches,
             encoder_mask_ratio=args.encoder_mask_ratio,
         )

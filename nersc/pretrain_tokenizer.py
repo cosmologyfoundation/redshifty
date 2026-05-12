@@ -242,17 +242,21 @@ def main():
 
     # Train
     step = 0
+    epoch = 0
     best_val = float("inf")
     t_start = time.time()
+    if train_sampler is not None:
+        train_sampler.set_epoch(epoch)
     train_iter = iter(train_loader)
     model.train()
-    if train_sampler is not None:
-        train_sampler.set_epoch(0)
 
     while step < args.steps:
         try:
             batch = next(train_iter)
         except StopIteration:
+            epoch += 1
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
             train_iter = iter(train_loader)
             batch = next(train_iter)
         if batch is None:
@@ -308,7 +312,10 @@ def main():
             }, step=step)
 
         if rank == 0 and step > 0 and step % args.val_every == 0:
-            val_losses = evaluate(model, val_loader, device, args.amp)
+            val_losses = evaluate(
+                model.module if is_distributed else model,
+                val_loader, device, args.amp,
+            )
             model.train()
             msg = {"kind": "val", "step": step, **{f"val_{k}": v for k, v in val_losses.items()}}
             print(f"[val   {step:6d}] " + " ".join(f"{k}={v:.4f}" for k, v in val_losses.items()))

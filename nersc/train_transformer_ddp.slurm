@@ -83,9 +83,11 @@ if [ ! -s "$MANIFEST" ]; then
         --out "$MANIFEST"
 fi
 
-# Translate SLURM vars -> PyTorch DDP env vars
-export RANK=${SLURM_PROCID}
-export LOCAL_RANK=${SLURM_LOCALID}
+# Global rendezvous vars (same for all tasks). RANK/LOCAL_RANK are
+# per-task and must NOT be exported here — srun sets SLURM_PROCID /
+# SLURM_LOCALID per child task, and the Python entrypoint reads those.
+# Exporting RANK at batch level would propagate one value (typically 0)
+# to all 4 srun children, causing every rank to think it's rank 0.
 export WORLD_SIZE=${SLURM_NTASKS}
 export MASTER_PORT=$(( 29500 + (SLURM_JOB_ID % 1000) ))
 export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)
