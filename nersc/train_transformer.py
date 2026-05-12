@@ -1,17 +1,14 @@
 """
 Train SpectrumTransformer on DR1 with a pretrained tokenizer.
 
-Drop-in NERSC counterpart to scripts/train.py:
-- Reads DR1 healpix coadds via the manifest from build_dr1_index.py
-- Loads pretrained SpectrumTokenizer weights (frozen, eval)
-- Fits the redshift tokenizer on a sample of manifest redshifts
-- Trains the transformer for either Approach A (joint) or B (masked)
-- Single-GPU AMP loop; mirrors best/final checkpoints to $CFS_OUT
-
-DataLoader workers produce raw spectra only (no CUDA touches). The
-spectrum tokenizer runs on the full batch on the main process's GPU --
-this avoids the "Cannot re-initialize CUDA in forked subprocess" error
-and is much faster than per-item encode in workers.
+Thin CLI wrapper. All non-NERSC-specific training logic lives in
+`src/training/` so it's reusable from notebooks / tests / `scripts/`
+without dragging in DR1 paths. This file only handles:
+  - argparse + smoke override
+  - DR1 manifest loading (NERSC-specific filesystem paths)
+  - SpectrumTokenizer load + RedshiftTokenizer fit
+  - Healpix-level train/val partitioning of records
+  - The actual training loop using helpers from src/training/
 
 Usage (from inside a SLURM job; see train_transformer.slurm):
 
@@ -28,7 +25,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import shutil
 import sys
@@ -36,30 +32,33 @@ import time
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE))
 
-from src.models.transformer import (  # noqa: E402
-    EOS_TOKEN,
-    REDSHIFT_TOKEN_OFFSET,
-    SOS_TOKEN,
-    SPECTRUM_TOKEN_OFFSET,
-    SpectrumTransformer,
-)
+# Core logic — moved to src/training/ for reusability.
+from src.models.transformer import SpectrumTransformer  # noqa: E402
 from src.tokenizers.redshift import RedshiftTokenizer  # noqa: E402
 from src.tokenizers.spectrum import SpectrumTokenizer  # noqa: E402
-from src.training.utils import compute_loss_breakdown, compute_metrics  # noqa: E402
+from src.training.data_split import split_records_by_healpix  # noqa: E402
+from src.training.eval import evaluate, evaluate_ar  # noqa: E402
+from src.training.sequences import lr_at, tokenize_and_build  # noqa: E402
+from src.training.utils import (  # noqa: E402
+    compute_loss_breakdown,
+    compute_masked_metrics,
+    compute_metrics,
+)
+from src.training.wandb_util import init_wandb, wfinish, wlog  # noqa: E402
 
+# NERSC-specific DR1 loaders.
 from dr1_dataset import (  # noqa: E402
     DR1IndexedDataset,
     collate_dr1_skip_none,
     load_manifest,
 )
 from dr1_tokenized_dataset import collect_redshifts  # noqa: E402
-from _wandb_util import init_wandb, wfinish, wlog  # noqa: E402
 
 
 def parse_args():
@@ -69,7 +68,9 @@ def parse_args():
     p.add_argument("--tokenizer-ckpt", type=Path, required=True,
                    help="Pretrained SpectrumTokenizer .pt (best.pt or final.pt)")
     p.add_argument("--max-spectra", type=int, default=None)
-    p.add_argument("--val-frac", type=float, default=0.02)
+    p.add_argument("--healpix-holdout-frac", type=float, default=0.05,
+                   help="Fraction of HEALPIX FILES (not rows) to reserve "
+                        "for validation. Avoids same-pointing leakage.")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--z-fit-files", type=int, default=200,
                    help="How many redrock files to scan when fitting RedshiftTokenizer")
@@ -94,10 +95,14 @@ def parse_args():
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--amp", action="store_true")
     p.add_argument("--redshift-loss-weight", type=float, default=50.0,
-                   help="Multiplier on the position-0 (redshift) loss term "
-                        "relative to the position-1+ (spectrum) term. "
-                        "Defaults to 50 to compensate for redshift being 1/274 "
-                        "of the sequence; set 1.0 to disable.")
+                   help="Multiplier on position-0 (redshift) loss term.")
+    p.add_argument("--encoder-mask-ratio", type=float, default=0.15,
+                   help="Fraction of encoder spectrum positions to replace "
+                        "with [MASK]. BERT-style. 0.0 disables; 0.15 is "
+                        "BERT canonical. Forces honest spectrum reconstruction.")
+    p.add_argument("--ar-eval-batches", type=int, default=4,
+                   help="Number of batches to run through autoregressive "
+                        "eval at end-of-run and on best checkpoint.")
 
     # Logging
     p.add_argument("--run-name", type=str, default="approach_a")
@@ -116,87 +121,6 @@ def parse_args():
     return p.parse_args()
 
 
-def lr_at(step: int, base_lr: float, warmup: int, total: int) -> float:
-    if step < warmup:
-        return base_lr * (step + 1) / warmup
-    progress = (step - warmup) / max(1, total - warmup)
-    return base_lr * (0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * progress)))
-
-
-def tokenize_and_build(raw_batch, spec_tok, z_tok, approach, device):
-    """Worker batch -> transformer-ready (encoder, decoder_in, target) on device.
-
-    All sequences are fixed-length (the tokenizer interpolates to a fixed
-    grid before encoding), so no padding masks are needed.
-    """
-    flux = raw_batch["flux"].to(device, non_blocking=True)
-    ivar = raw_batch["ivar"].to(device, non_blocking=True)
-    z_vals = raw_batch["z"]  # CPU (B,)
-
-    istd = torch.sqrt(ivar.clamp(min=1e-10))
-    x = torch.stack([flux, istd], dim=1)  # (B, 2, L)
-
-    with torch.no_grad():
-        spec_indices, _ = spec_tok.encode(x)  # (B, n_tokens)
-    # Some tokenizer impls return (B, 1, n_tokens) -- squeeze if present.
-    if spec_indices.dim() == 3:
-        spec_indices = spec_indices.squeeze(1)
-    spec_tokens = spec_indices.long() + SPECTRUM_TOKEN_OFFSET
-
-    redshift_idx = torch.tensor(
-        [z_tok.encode(float(z)) for z in z_vals.tolist()],
-        dtype=torch.long, device=device,
-    )
-    redshift_tokens = redshift_idx + REDSHIFT_TOKEN_OFFSET
-
-    B = flux.shape[0]
-    sos = torch.full((B, 1), SOS_TOKEN, dtype=torch.long, device=device)
-    eos = torch.full((B, 1), EOS_TOKEN, dtype=torch.long, device=device)
-    rz = redshift_tokens.unsqueeze(1)  # (B, 1)
-
-    if approach == "a":
-        encoder_input = torch.cat([sos, rz, spec_tokens, eos], dim=1)
-    else:  # 'b'
-        encoder_input = torch.cat([sos, spec_tokens, eos], dim=1)
-
-    decoder_input = torch.cat([sos, rz, spec_tokens], dim=1)
-    target = torch.cat([rz, spec_tokens, eos], dim=1)
-    return encoder_input, decoder_input, target
-
-
-@torch.no_grad()
-def evaluate(model, loader, spec_tok, z_tok, approach, device, amp,
-             redshift_weight: float, max_batches: int = 50):
-    model.eval()
-    losses = 0.0
-    metrics_accum = {"overall_acc": 0.0, "redshift_acc": 0.0, "spectrum_acc": 0.0}
-    breakdown_accum = {"loss_redshift": 0.0, "loss_spectrum": 0.0, "loss_total": 0.0}
-    n = 0
-    for i, raw in enumerate(loader):
-        if raw is None:
-            continue
-        if i >= max_batches:
-            break
-        enc, dec, tgt = tokenize_and_build(raw, spec_tok, z_tok, approach, device)
-        with torch.amp.autocast("cuda", enabled=amp):
-            logits, loss = model(enc, dec, targets=tgt, redshift_weight=redshift_weight)
-        losses += float(loss.item())
-        m = compute_metrics(logits, tgt)
-        for k in metrics_accum:
-            metrics_accum[k] += m[k]
-        b = compute_loss_breakdown(logits, tgt)
-        for k in breakdown_accum:
-            breakdown_accum[k] += b[k]
-        n += 1
-    if n == 0:
-        nan = float("nan")
-        return {"loss": nan, **{k: nan for k in metrics_accum},
-                **{k: nan for k in breakdown_accum}}
-    out = {"loss": losses / n, **{k: v / n for k, v in metrics_accum.items()}}
-    out.update({k: v / n for k, v in breakdown_accum.items()})
-    return out
-
-
 def main():
     args = parse_args()
     if args.smoke:
@@ -213,9 +137,11 @@ def main():
         args.n_decoder_layers = 2
         args.n_heads = 8
         args.z_fit_files = min(args.z_fit_files, 5)
+        args.ar_eval_batches = 1
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[setup] device={device} approach={args.approach} steps={args.steps}")
+    print(f"[setup] device={device} approach={args.approach} steps={args.steps} "
+          f"mask_ratio={args.encoder_mask_ratio} redshift_weight={args.redshift_loss_weight}")
     run_dir = args.scratch_out / "checkpoints" / args.run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = run_dir / "metrics.jsonl"
@@ -228,6 +154,13 @@ def main():
     records = load_manifest(args.manifest)
     print(f"[data] {len(records)} healpix records")
 
+    # Healpix-level train/val split — no same-pointing leakage.
+    train_records, val_records = split_records_by_healpix(
+        records, holdout_frac=args.healpix_holdout_frac, seed=args.seed,
+    )
+    print(f"[data] healpix split: {len(train_records)} train, "
+          f"{len(val_records)} val (frac={args.healpix_holdout_frac})")
+
     # Pretrained spectrum tokenizer (lives on GPU in main process; never forked)
     print(f"[tok] loading spectrum tokenizer {args.tokenizer_ckpt}")
     spec_tok = SpectrumTokenizer().to(device)
@@ -238,28 +171,27 @@ def main():
     for p in spec_tok.parameters():
         p.requires_grad_(False)
 
-    # Fit redshift tokenizer on a sample of manifest redshifts
+    # Fit redshift tokenizer on a sample of TRAIN manifest redshifts
     print(f"[tok] fitting redshift tokenizer on up to {args.z_fit_files} redrock files")
-    zs = collect_redshifts(records, max_files=args.z_fit_files)
+    zs = collect_redshifts(train_records, max_files=args.z_fit_files)
     print(f"[tok]   gathered {len(zs)} z values, min={zs.min():.4f} max={zs.max():.4f}")
     z_tok = RedshiftTokenizer(n_levels=256)
     z_tok.fit(zs)
 
-    # Datasets -- raw spectra only (CPU). Workers safe to fork.
-    base = DR1IndexedDataset(
-        records,
+    # Build separate datasets for each partition.
+    train_ds = DR1IndexedDataset(
+        train_records,
         require_good_zwarn=True,
         require_nonzero_flux=True,
         max_spectra=args.max_spectra,
     )
-    print(f"[data] {len(base)} spectra in flat index")
-
-    g = torch.Generator().manual_seed(args.seed)
-    perm = torch.randperm(len(base), generator=g).tolist()
-    n_val = max(1, int(len(base) * args.val_frac))
-    val_idx, train_idx = perm[:n_val], perm[n_val:]
-    train_ds, val_ds = Subset(base, train_idx), Subset(base, val_idx)
-    print(f"[data] train={len(train_ds)} val={len(val_ds)}")
+    val_ds = DR1IndexedDataset(
+        val_records,
+        require_good_zwarn=True,
+        require_nonzero_flux=True,
+        max_spectra=None if args.max_spectra is None else max(50, args.max_spectra // 10),
+    )
+    print(f"[data] train_ds={len(train_ds)} val_ds={len(val_ds)}")
 
     train_loader = DataLoader(
         train_ds,
@@ -301,6 +233,8 @@ def main():
         "n_train": len(train_ds),
         "n_val": len(val_ds),
         "n_manifest_records": len(records),
+        "n_train_records": len(train_records),
+        "n_val_records": len(val_records),
     })
     wandb_dir = args.scratch_out / "wandb" / args.run_name
     wandb_run = init_wandb(
@@ -329,7 +263,10 @@ def main():
         for g_ in optim.param_groups:
             g_["lr"] = lr_at(step, args.lr, args.warmup, args.steps)
 
-        enc, dec, tgt = tokenize_and_build(raw, spec_tok, z_tok, args.approach, device)
+        enc, dec, tgt, mask_pos = tokenize_and_build(
+            raw, spec_tok, z_tok, args.approach, device,
+            encoder_mask_ratio=args.encoder_mask_ratio,
+        )
 
         optim.zero_grad(set_to_none=True)
         with torch.amp.autocast("cuda", enabled=args.amp):
@@ -346,17 +283,23 @@ def main():
             with torch.no_grad():
                 m = compute_metrics(logits, tgt)
                 b = compute_loss_breakdown(logits, tgt)
+                mm = (compute_masked_metrics(logits, tgt, mask_pos)
+                      if mask_pos is not None else
+                      {"masked_spec_acc": float("nan"), "n_masked": 0})
             dt = time.time() - t0
             rate = (step + 1) / max(dt, 1e-6)
             msg = {
                 "kind": "train", "step": step, "lr": optim.param_groups[0]["lr"],
                 "loss": float(loss.item()),
                 **m, **b,
+                "masked_spec_acc": mm["masked_spec_acc"],
+                "n_masked": mm["n_masked"],
                 "steps_per_sec": rate, "elapsed_s": dt,
             }
             print(f"[step {step:6d}] loss={msg['loss']:.4f} "
                   f"z_loss={b['loss_redshift']:.3f} spec_loss={b['loss_spectrum']:.3f} "
                   f"z_acc={m['redshift_acc']:.3f} spec_acc={m['spectrum_acc']:.3f} "
+                  f"masked_acc={mm['masked_spec_acc']:.3f} "
                   f"{rate:.1f} step/s")
             with metrics_path.open("a") as f:
                 f.write(json.dumps(msg) + "\n")
@@ -369,12 +312,16 @@ def main():
                 "train/overall_acc": m["overall_acc"],
                 "train/redshift_acc": m["redshift_acc"],
                 "train/spectrum_acc": m["spectrum_acc"],
+                "train/masked_spec_acc": mm["masked_spec_acc"],
                 "train/steps_per_sec": rate,
             }, step=step)
 
         if step > 0 and step % args.val_every == 0:
-            v = evaluate(model, val_loader, spec_tok, z_tok, args.approach, device,
-                         args.amp, args.redshift_loss_weight)
+            v = evaluate(
+                model, val_loader, spec_tok, z_tok, args.approach, device,
+                args.amp, args.redshift_loss_weight,
+                encoder_mask_ratio=args.encoder_mask_ratio,
+            )
             model.train()
             print(f"[val   {step:6d}] " + " ".join(f"{k}={v[k]:.4f}" for k in v))
             with metrics_path.open("a") as f:
@@ -396,6 +343,19 @@ def main():
                     args.cfs_out.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(p, args.cfs_out / "best.pt")
 
+                # AR eval on the new best (cheap-ish).
+                ar = evaluate_ar(
+                    model, val_loader, spec_tok, z_tok, args.approach, device,
+                    max_batches=args.ar_eval_batches,
+                    encoder_mask_ratio=args.encoder_mask_ratio,
+                )
+                model.train()
+                print(f"  [ar_best {step:6d}] " + " ".join(f"{k}={ar[k]}" for k in ar))
+                with metrics_path.open("a") as f:
+                    f.write(json.dumps({"kind": "ar_best", "step": step,
+                                        **{f"val_ar_{k}": vv for k, vv in ar.items()}}) + "\n")
+                wlog(wandb_run, {f"val_ar/{k}": vv for k, vv in ar.items()}, step=step)
+
         if step > 0 and step % args.save_every == 0:
             p = run_dir / f"step_{step:08d}.pt"
             torch.save({"step": step, "model": model.state_dict()}, p)
@@ -403,12 +363,25 @@ def main():
 
         step += 1
 
+    # Final
     p = run_dir / "final.pt"
     torch.save({"step": step, "model": model.state_dict()}, p)
     print(f"[done] final -> {p}  best_val_loss={best_val:.4f}")
     if args.cfs_out is not None:
         args.cfs_out.mkdir(parents=True, exist_ok=True)
         shutil.copy2(p, args.cfs_out / "final.pt")
+
+    # AR eval on final.
+    ar_final = evaluate_ar(
+        model, val_loader, spec_tok, z_tok, args.approach, device,
+        max_batches=args.ar_eval_batches,
+        encoder_mask_ratio=args.encoder_mask_ratio,
+    )
+    print(f"[ar_final {step:6d}] " + " ".join(f"{k}={ar_final[k]}" for k in ar_final))
+    with metrics_path.open("a") as f:
+        f.write(json.dumps({"kind": "ar_final", "step": step,
+                            **{f"val_ar_{k}": vv for k, vv in ar_final.items()}}) + "\n")
+    wlog(wandb_run, {f"val_ar/{k}": vv for k, vv in ar_final.items()}, step=step)
 
     wfinish(wandb_run)
 

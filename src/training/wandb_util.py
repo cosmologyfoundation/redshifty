@@ -1,15 +1,15 @@
 """
-Wandb helper shared by the NERSC trainers.
+Wandb helper used by training scripts (NERSC + local).
 
-- Reads WANDB_API_KEY from a repo-root .env via python-dotenv.
+- Reads `WANDB_API_KEY` from a repo-root `.env` via python-dotenv.
 - Supports online / offline / disabled modes.
-- Logs to a stable subdir of $SCRATCH so artifacts survive the SLURM
-  step but are easy to clean up.
+- Forces `os.environ["WANDB_MODE"]` before calling `wandb.init` so any
+  upstream-set `WANDB_MODE` (e.g. NERSC's pytorch module defaulting to
+  offline) doesn't silently override the CLI choice.
 
-All functions are no-ops when mode == "disabled", and tolerate wandb
-import failures gracefully (helpful for compute nodes that can't reach
-PyPI to upgrade the module). Tests on a CPU laptop work fine in
-"disabled" mode without ever importing wandb.
+All functions are no-ops when `mode == "disabled"`, and tolerate
+wandb / python-dotenv import failures gracefully so the test suite can
+run on a CPU laptop without installing them.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ def init_wandb(
         dotenv_path: path to .env (default: search from cwd upward).
 
     Returns:
-        wandb Run object, or None if mode == "disabled".
+        wandb Run object, or None if mode == "disabled" or init fails.
     """
     if mode == "disabled":
         return None
@@ -51,18 +51,22 @@ def init_wandb(
         else:
             load_dotenv()
     except ImportError:
-        # python-dotenv isn't installed; rely on the env directly.
         pass
+
+    if mode == "online" and not os.environ.get("WANDB_API_KEY"):
+        print("[wandb] WANDB_API_KEY not set; falling back to offline mode")
+        mode = "offline"
+
+    # CRITICAL: set env var BEFORE importing/initing wandb so that any
+    # ambient WANDB_MODE (e.g. NERSC pytorch module sets it to "offline")
+    # is overridden by our explicit choice.
+    os.environ["WANDB_MODE"] = mode
 
     try:
         import wandb
     except ImportError:
         print("[wandb] wandb not installed; logging disabled")
         return None
-
-    if mode == "online" and not os.environ.get("WANDB_API_KEY"):
-        print("[wandb] WANDB_API_KEY not set; falling back to offline mode")
-        mode = "offline"
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

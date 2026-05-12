@@ -73,6 +73,48 @@ def compute_metrics(logits: torch.Tensor, target: torch.Tensor) -> Dict[str, flo
     }
 
 
+def compute_masked_metrics(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    masked_positions: torch.Tensor,
+) -> Dict[str, float]:
+    """Spectrum accuracy restricted to encoder-masked positions.
+
+    This is the honest spectrum-reconstruction metric — accuracy at the
+    decoder positions whose corresponding encoder position was replaced
+    with `MASK_TOKEN`. Computed only over positions where the model
+    could not trivially copy from the encoder.
+
+    Layout assumption (matches `tokenize_and_build`):
+      target = [redshift, s_1, s_2, ..., s_T, EOS]                 (B, T+2)
+      masked_positions[i, j] is True iff encoder pos for `s_{j+1}`
+        was masked. So target index for masked_positions[i, j] is j+1.
+
+    Args:
+        logits: (B, L, V)
+        target: (B, L) with -100 for ignored positions
+        masked_positions: (B, T) bool
+
+    Returns:
+        {'masked_spec_acc': float, 'n_masked': int}
+        masked_spec_acc is NaN if no positions were masked in the batch.
+    """
+    pred = logits.argmax(dim=-1)  # (B, L)
+    B, T_spec = masked_positions.shape
+    # Spectrum-token target positions live at indices [1, 1+T_spec).
+    spec_target = target[:, 1:1 + T_spec]
+    spec_pred = pred[:, 1:1 + T_spec]
+    valid = (spec_target != -100) & masked_positions.bool()
+    n_masked = int(valid.sum().item())
+    if n_masked == 0:
+        return {'masked_spec_acc': float('nan'), 'n_masked': 0}
+    correct = ((spec_pred == spec_target) & valid).sum().float()
+    return {
+        'masked_spec_acc': (correct / n_masked).item(),
+        'n_masked': n_masked,
+    }
+
+
 def compute_loss_breakdown(logits: torch.Tensor, target: torch.Tensor) -> Dict[str, float]:
     """Unweighted per-segment loss for logging.
 

@@ -467,3 +467,104 @@ The interesting behavior often emerges after a long flat period.
 - `nersc/train_transformer.slurm`, `nersc/smoke_transformer.slurm` — SLURM entry points
 - `requirements.txt`, `pyproject.toml`, `nersc/setup_env.sh` — `python-dotenv` added
 - `nersc/README.md` — wandb + weighting documentation
+
+---
+
+## 2026-05-12: Phase 9 Final Result — Thesis Tested
+
+### Setup
+
+- Two 6h runs in parallel: jobs 52840231 (Approach A) / 52840234 (Approach B).
+- `redshift_loss_weight=50` (per Phase 9 fix).
+- 200 healpix files (sv3+main, bright+dark), 393967 spectra in flat index.
+- Frozen pretrained tokenizer from Phase 8 (`tokenizer_v1_52693687/best.pt`, val_recon 1.35).
+- 100M parameter transformer: `d_model=768`, 6 encoder + 6 decoder layers, 12 heads, AMP on.
+- AdamW, lr=2e-4, cosine schedule with 1000-step linear warmup. batch=8.
+- Throughput ~0.55 step/s — both jobs hit the 6h wallclock somewhere around step 10000–12000.
+
+### Result: A learns, B stays at random
+
+**Approach A** discovered the cross-attention "copy redshift from encoder" pathway at step ~6500 and z_acc climbed steeply from there:
+
+| step | val_redshift_acc | val_loss_redshift | val_spectrum_acc | val_loss_spectrum |
+|---|---|---|---|---|
+| 500 | 0.6% | 5.10 | 0.0% | 6.64 |
+| 1500 | 1.5% | 4.90 | 15.6% | 3.70 |
+| 3000 | 1.5% | 4.81 | 23.6% | 3.07 |
+| 4500 | 1.0% | 4.80 | 25.7% | 2.88 |
+| 5500 | 5.8% | 4.19 | 26.7% | 2.82 |
+| **6500** | **18.4%** | **3.65** | 27.0% | 2.80 |
+| 8000 | 29.3% | 2.94 | 27.9% | 2.75 |
+| 9000 | 36.7% | 2.61 | 28.2% | 2.73 |
+| 10000 | 42.4% | 2.44 | 28.5% | 2.71 |
+| 11000 | 49.2% | 2.18 | 28.9% | 2.68 |
+| **11500** | **52.4%** | **2.09** | 29.0% | 2.68 |
+
+**Approach B** stayed at noise floor the entire run:
+
+| step | val_redshift_acc | val_loss_redshift | val_spectrum_acc | val_loss_spectrum |
+|---|---|---|---|---|
+| 500 | 0.7% | 4.92 | 0.0% | 6.62 |
+| 1500 | 0.3% | 4.77 | 11.2% | 3.70 |
+| 3000 | 1.4% | 4.75 | 20.4% | 3.21 |
+| 4500 | 2.3% | 4.66 | 24.0% | 3.00 |
+| 5500 | 1.3% | 4.75 | 25.8% | 2.91 |
+| 6500 | 0.25% | 4.65 | 26.5% | 2.86 |
+| 8000 | 1.1% | 4.56 | 27.3% | 2.81 |
+| 9500 | 1.8% | 4.60 | 28.2% | 2.76 |
+| 10000 | 1.2% | 4.53 | 28.3% | 2.74 |
+
+B's `loss_redshift` dropped only 4.92 → 4.53 in 10000 steps (A's dropped 5.10 → 2.09). The encoder is not learning to encode redshift into its hidden state from spectrum features.
+
+### Interpretation: the project's thesis answered
+
+The project's hypothesis (from the assignment, addressing the AION-1 critique): **forcing reconstruction of redshift from spectral context every step** (Approach B) should make redshift an organizing principle of the encoder representation. The result, with our 100M model + 10000 training steps + frozen pretrained tokenizer + 395k spectra:
+
+**B does not work.** When the encoder doesn't see the redshift token directly, the encoder simply leaves redshift unlearned. The decoder, given no redshift signal in cross-attention context, cannot recover the value, and the position-0 loss term stays near `log(256)/log(e) ≈ 5.5` (random over 256 bins).
+
+**A trivially succeeds**, but for an uninteresting reason. With the redshift token included in the encoder input, the decoder learns a cross-attention copy pattern that lifts redshift from encoder position 1 to decoder position 0. This is the same trivial-copy phenomenon that inflates `spec_acc` (see Section: "Proof"). It tests neither spectroscopy nor representation learning — only attention-pattern discovery.
+
+### Proof: the unweighted runs' 99% spec_acc was trivial copy
+
+Pre-fix runs without redshift weighting (jobs 52827566 / 52827575) reached:
+- A: val_spectrum_acc 97.2% at step 9000
+- B: val_spectrum_acc 99.97% at step 9000
+
+These accuracies on held-out unseen galaxies cannot be memorization. The mechanism is structural:
+
+1. The decoder at position `j` (`j ≥ 1`) is predicting spectrum token `s_j`.
+2. The encoder is `[SOS, (redshift,) s1, s2, ..., sN, EOS]` — the same `s_j` sits at encoder position `j` (B) or `j+1` (A).
+3. Cross-attention is unmasked. The decoder learns one attention head: "from decoder position `j`, attend to encoder position `j` (B) or `j+1` (A), copy that token."
+4. This is a positional shift-and-copy pattern, *data-independent*. It works on every galaxy the model has ever seen and every galaxy it will ever see, because it doesn't depend on galaxy identity.
+
+Evidence this is the mechanism:
+
+- The val_spectrum_acc curve from step 5500 → 7000 jumped from 50% to 99% in 1500 steps for B. This is consistent with "the model just discovered the right attention pattern," not "the model spent 1500 steps learning more spectroscopy."
+- B reaches 99.97% but A only 97.2% — the offset in B is simpler (shift by 1) than in A (shift by 2 because of the redshift token), so B converges faster and tighter.
+- `val_redshift_acc` stayed at random (~2–4%) the entire pre-fix run: position 0 cannot be solved by copy (B has no source; A has a source at position 1 but the 1/274 gradient share is too small to motivate the copy from position 1 vs from the trivial position-1+offset rule the model has already discovered).
+
+Conclusion: **under the current encoder-decoder + teacher-forced + unmasked-cross-attention architecture, `val_spectrum_acc` does not measure spectrum understanding**. It measures whether the cross-attention copy pattern has been discovered. An honest spectrum reconstruction metric requires either encoder masking (BERT-style) or autoregressive evaluation without teacher forcing.
+
+### AION-1 critique revisited
+
+The original pitch: AION-1 treated redshift like any other token, masked occasionally, so redshift never became an organizing principle of the encoder representation. Our project would fix this by *always* masking redshift (Approach B) and forcing the encoder to encode it.
+
+The current result refines the critique. AION-1's failure mode is real, but **always-masking does not by itself make the encoder encode redshift**. The encoder leaves redshift unlearned regardless of how aggressively the loss penalizes the decoder's failure to recover it. The information has to enter the encoder representation through some *constructive* mechanism, not just through the absence of an alternative shortcut.
+
+Candidate mechanisms for making B work (none tested in this phase):
+
+- **Auxiliary redshift head on the encoder.** Pool encoder outputs (mean, max, or CLS-token style) and predict z from the pooled vector with an auxiliary cross-entropy loss. This is closer to what AION-1 itself did with a separate frozen head, but we'd train it jointly to apply gradient pressure on the encoder.
+- **Contrastive loss.** Pull together encoder representations of galaxies with similar redshift; push apart those with different redshift. Forces the encoder's geometry to align with z.
+- **Larger encoder capacity / longer training.** B's `loss_redshift` was essentially flat after step 4000, so this is the least likely fix. The information bottleneck appears architectural, not capacity-bound.
+- **Continuous redshift loss + scalar head** (instead of discrete bin classification). May give cleaner gradient signal than 256-way softmax.
+
+### Implications for Phase 10
+
+The weight=50 fix (Phase 9) is the right value for A and we should keep it as default. B's failure is not a hyperparameter problem; it's a structural one. Phase 10's encoder masking (next) fixes the `spec_acc` honesty problem and gives us a real metric for both A and B. After that, we can decide whether to test one of the B-rescue candidates above as Phase 11.
+
+### Files referenced
+- Train metrics for A: `$SCRATCH/deepsrch/checkpoints/approach_a_52840231/metrics.jsonl`
+- Train metrics for B: `$SCRATCH/deepsrch/checkpoints/approach_b_52840234/metrics.jsonl`
+- Pre-fix unweighted A: `$SCRATCH/deepsrch/checkpoints/approach_a_52827566/metrics.jsonl`
+- Pre-fix unweighted B: `$SCRATCH/deepsrch/checkpoints/approach_b_52827575/metrics.jsonl`
+- Tokenizer used: `$SCRATCH/deepsrch/checkpoints/tokenizer_v1_52693687/best.pt`

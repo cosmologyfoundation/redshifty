@@ -59,6 +59,12 @@ NUM_WORKERS="${NUM_WORKERS:-4}"
 D_MODEL="${D_MODEL:-768}"
 N_LAYERS="${N_LAYERS:-6}"
 N_HEADS="${N_HEADS:-12}"
+REDSHIFT_LOSS_WEIGHT="${REDSHIFT_LOSS_WEIGHT:-50.0}"
+ENCODER_MASK_RATIO="${ENCODER_MASK_RATIO:-0.15}"
+HEALPIX_HOLDOUT_FRAC="${HEALPIX_HOLDOUT_FRAC:-0.05}"
+AR_EVAL_BATCHES="${AR_EVAL_BATCHES:-4}"
+WANDB_MODE_ARG="${WANDB_MODE:-online}"
+WANDB_PROJECT="${WANDB_PROJECT:-redshifty}"
 # -------------------------------------
 
 MANIFEST="${MANIFEST:-$SCRATCH_OUT/manifests/dr1_${MAX_HEALPIX}.jsonl}"
@@ -91,6 +97,12 @@ srun -n 1 -c 32 -G 1 python "$REPO/nersc/train_transformer.py" \
     --n-encoder-layers "$N_LAYERS" \
     --n-decoder-layers "$N_LAYERS" \
     --n-heads "$N_HEADS" \
+    --redshift-loss-weight "$REDSHIFT_LOSS_WEIGHT" \
+    --encoder-mask-ratio "$ENCODER_MASK_RATIO" \
+    --healpix-holdout-frac "$HEALPIX_HOLDOUT_FRAC" \
+    --ar-eval-batches "$AR_EVAL_BATCHES" \
+    --wandb-mode "$WANDB_MODE_ARG" \
+    --wandb-project "$WANDB_PROJECT" \
     --amp
 
 echo "[train] done; best/final mirrored to $CFS_OUT"

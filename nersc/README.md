@@ -166,6 +166,57 @@ token, the default of 50 gives redshift ~15% of the effective gradient
 share (vs ~0.4% unweighted), which is enough to actually train the
 redshift prediction. Set `--redshift-loss-weight 1.0` to disable.
 
+## Encoder masking (BERT-style)
+
+`train_transformer.py` accepts `--encoder-mask-ratio` (default **0.15**).
+A fraction of spectrum tokens in the *encoder* input are replaced with
+`[MASK]` before the model sees them. The decoder input and target are
+unchanged. This forces the model to actually infer spectrum tokens from
+context — without it, cross-attention learns a trivial positional copy
+and `spec_acc` becomes a dishonest 99%+.
+
+Three spec accuracy numbers are logged per run:
+
+| metric | what it measures |
+|---|---|
+| `val/spectrum_acc` | accuracy over all decoder spectrum positions (masked + unmasked). Partially inflated by the unmasked copy. |
+| `val/masked_spec_acc` | accuracy at decoder positions whose encoder position was `[MASK]`. **The honest training-time number.** |
+| `val_ar/spectrum_acc` | autoregressive generation, no teacher forcing. **The honest generation-time number.** Logged at every best-checkpoint update and at end of run. |
+
+Set `--encoder-mask-ratio 0.0` to disable (will reproduce the dishonest 99% pattern).
+
+## Held-out healpix split
+
+`--healpix-holdout-frac` (default **0.05**) reserves entire healpix files
+for validation rather than splitting by row. Eliminates same-pointing
+leakage (fibers in the same exposure share sky background, conditions).
+
+## SLURM env-var overrides
+
+`train_transformer.slurm` reads these env vars at submit time so you can
+sweep without editing scripts:
+
+| env var | flag | default |
+|---|---|---|
+| `REDSHIFT_LOSS_WEIGHT` | `--redshift-loss-weight` | 50.0 |
+| `ENCODER_MASK_RATIO` | `--encoder-mask-ratio` | 0.15 |
+| `HEALPIX_HOLDOUT_FRAC` | `--healpix-holdout-frac` | 0.05 |
+| `AR_EVAL_BATCHES` | `--ar-eval-batches` | 4 |
+| `WANDB_MODE` | `--wandb-mode` | online |
+| `WANDB_PROJECT` | `--wandb-project` | redshifty |
+| `STEPS`, `BATCH_SIZE`, `LR`, `NUM_WORKERS` | — | see script |
+| `MAX_HEALPIX`, `MANIFEST`, `RUN_NAME`, `CFS_OUT` | — | see script |
+
+Example: weight sweep for Approach A across 7 values:
+
+```bash
+for w in 1 5 10 20 50 100 200; do
+    REDSHIFT_LOSS_WEIGHT=$w APPROACH=a STEPS=8000 \
+        RUN_NAME=sweep_a_w${w} \
+        sbatch -t 03:00:00 nersc/train_transformer.slurm
+done
+```
+
 ## Stage 2: Train the transformer with a pretrained tokenizer
 
 Once `pretrain_tokenizer.slurm` (or the trial run) lands a `best.pt` you

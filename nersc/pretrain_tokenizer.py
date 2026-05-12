@@ -34,6 +34,7 @@ from torch.utils.data import DataLoader, Subset
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 from src.tokenizers.spectrum import SpectrumTokenizer  # noqa: E402
+from src.training.wandb_util import init_wandb, wfinish, wlog  # noqa: E402
 
 # Local imports
 sys.path.insert(0, str(HERE))
@@ -42,7 +43,6 @@ from dr1_dataset import (  # noqa: E402
     collate_dr1_skip_none,
     load_manifest,
 )
-from _wandb_util import init_wandb, wfinish, wlog  # noqa: E402
 
 
 def parse_args():

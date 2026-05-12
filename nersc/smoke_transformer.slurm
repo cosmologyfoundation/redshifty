@@ -45,12 +45,23 @@ if [ ! -s "$MANIFEST" ]; then
         --out "$MANIFEST"
 fi
 
+ENCODER_MASK_RATIO="${ENCODER_MASK_RATIO:-0.15}"
+REDSHIFT_LOSS_WEIGHT="${REDSHIFT_LOSS_WEIGHT:-50.0}"
+HEALPIX_HOLDOUT_FRAC="${HEALPIX_HOLDOUT_FRAC:-0.2}"   # tiny manifest -> larger frac
+WANDB_MODE_ARG="${WANDB_MODE:-disabled}"
+WANDB_PROJECT="${WANDB_PROJECT:-redshifty}"
+
 srun -n 1 -c 32 -G 1 python "$REPO/nersc/train_transformer.py" \
     --manifest "$MANIFEST" \
     --tokenizer-ckpt "$TOKENIZER_CKPT" \
     --approach "$APPROACH" \
     --run-name "$RUN_NAME" \
     --scratch-out "$SCRATCH_OUT" \
+    --encoder-mask-ratio "$ENCODER_MASK_RATIO" \
+    --redshift-loss-weight "$REDSHIFT_LOSS_WEIGHT" \
+    --healpix-holdout-frac "$HEALPIX_HOLDOUT_FRAC" \
+    --wandb-mode "$WANDB_MODE_ARG" \
+    --wandb-project "$WANDB_PROJECT" \
     --smoke
 
 echo "[smoke] OK"

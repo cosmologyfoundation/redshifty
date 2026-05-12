@@ -44,9 +44,10 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE))
 
-from _wandb_util import init_wandb, wfinish, wlog  # noqa: E402
+from src.training.wandb_util import init_wandb, wfinish, wlog  # noqa: E402
 
 
 # Per-key namespacing. Anything starting with "val_" goes to val/<name>;
