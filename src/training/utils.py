@@ -115,6 +115,39 @@ def compute_masked_metrics(
     }
 
 
+def compute_masked_redshift_acc(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    rz_mask: torch.Tensor,
+) -> Dict[str, float]:
+    """Redshift accuracy restricted to samples where the encoder's rz was masked.
+
+    This is the honest redshift metric — accuracy at decoder position 0 only
+    for samples where the encoder received [MASK] instead of the actual
+    redshift token. Computed only over positions where the model could not
+    trivially copy from the encoder.
+
+    Args:
+        logits: (B, L, V)
+        target: (B, L) with -100 for ignored positions
+        rz_mask: (B, 1) bool — True where encoder rz was replaced with MASK
+
+    Returns:
+        {'redshift_acc_masked': float, 'n_rz_masked': int}
+        redshift_acc_masked is NaN if no samples were masked in the batch.
+    """
+    pred = logits.argmax(dim=-1)  # (B, L)
+    valid = (target[:, 0] != -100) & rz_mask.squeeze(-1)
+    n = int(valid.sum().item())
+    if n == 0:
+        return {'redshift_acc_masked': float('nan'), 'n_rz_masked': 0}
+    correct = ((pred[:, 0] == target[:, 0]) & valid).sum().float()
+    return {
+        'redshift_acc_masked': (correct / n).item(),
+        'n_rz_masked': n,
+    }
+
+
 def compute_loss_breakdown(logits: torch.Tensor, target: torch.Tensor) -> Dict[str, float]:
     """Unweighted per-segment loss for logging.
 

@@ -17,6 +17,7 @@ from src.models.transformer import (
     encode_redshift_token,
     build_approach_a_sequences,
     build_approach_b_sequences,
+    MASK_TOKEN,
     PAD_TOKEN,
 )
 
@@ -39,12 +40,14 @@ class TokenizedSpectrumDataset(Dataset):
         redshift_tokenizer: RedshiftTokenizer,
         approach: str = 'a',
         device: torch.device = torch.device('cpu'),
+        encoder_mask_ratio: float = 0.0,
     ):
         self.spectra = spectra
         self.spectrum_tokenizer = spectrum_tokenizer.to(device)
         self.redshift_tokenizer = redshift_tokenizer
         self.approach = approach.lower()
         self.device = device
+        self.encoder_mask_ratio = encoder_mask_ratio
         
         assert self.approach in ('a', 'b'), f"approach must be 'a' or 'b', got {approach}"
     
@@ -78,12 +81,20 @@ class TokenizedSpectrumDataset(Dataset):
         else:
             enc, dec_in, target = build_approach_b_sequences(redshift_token, spectrum_tokens)
         
+        # Stochastically mask the redshift token in the encoder (approach A only).
+        rz_masked = False
+        if self.approach == 'a' and self.encoder_mask_ratio > 0.0:
+            if torch.rand(1).item() < self.encoder_mask_ratio:
+                enc[1] = MASK_TOKEN
+                rz_masked = True
+        
         return {
             'encoder_input': enc,
             'decoder_input': dec_in,
             'target': target,
             'redshift': torch.tensor(float(z), dtype=torch.float32),
             'denorm': denorm.cpu(),
+            'rz_masked': torch.tensor(rz_masked),
         }
 
 
@@ -136,4 +147,5 @@ def collate_tokenized_batch(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         'decoder_mask': decoder_mask,
         'redshift': torch.stack([item['redshift'] for item in batch]),
         'denorm': torch.stack([item['denorm'] for item in batch]),
+        'rz_masked': torch.stack([item['rz_masked'] for item in batch]),
     }

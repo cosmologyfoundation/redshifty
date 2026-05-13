@@ -37,7 +37,7 @@ def tokenize_and_build(
     device: torch.device,
     encoder_mask_ratio: float = 0.0,
     rng: Optional[torch.Generator] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Convert a raw spectrum batch into transformer-ready sequences.
 
     Args:
@@ -60,6 +60,9 @@ def tokenize_and_build(
             encoder's spectrum tokens were replaced by MASK. None if
             `encoder_mask_ratio == 0.0`. T_spec = number of spectrum
             positions per sequence (e.g. 272 from the tokenizer).
+        rz_mask: (B, 1) bool tensor — True where the encoder's redshift
+            token was replaced by MASK (approach A only). None if
+            `encoder_mask_ratio == 0.0` or approach is "b".
     """
     if approach not in ("a", "b"):
         raise ValueError(f"approach must be 'a' or 'b', got {approach!r}")
@@ -105,8 +108,18 @@ def tokenize_and_build(
             spec_tokens,
         )
 
+    # Stochastically mask the redshift token in the encoder (approach A only).
+    rz_mask: Optional[torch.Tensor] = None
+    rz_enc = rz
+    if approach == "a" and encoder_mask_ratio > 0.0:
+        if rng is None:
+            rz_mask = torch.rand(B, 1, device=device) < encoder_mask_ratio
+        else:
+            rz_mask = torch.rand(B, 1, device=device, generator=rng) < encoder_mask_ratio
+        rz_enc = torch.where(rz_mask, torch.full_like(rz, MASK_TOKEN), rz)
+
     if approach == "a":
-        encoder_input = torch.cat([sos, rz, spec_tokens_enc, eos], dim=1)
+        encoder_input = torch.cat([sos, rz_enc, spec_tokens_enc, eos], dim=1)
     else:  # 'b'
         encoder_input = torch.cat([sos, spec_tokens_enc, eos], dim=1)
 
@@ -114,7 +127,7 @@ def tokenize_and_build(
     decoder_input = torch.cat([sos, rz, spec_tokens], dim=1)
     target = torch.cat([rz, spec_tokens, eos], dim=1)
 
-    return encoder_input, decoder_input, target, masked_positions
+    return encoder_input, decoder_input, target, masked_positions, rz_mask
 
 
 def lr_at(step: int, base_lr: float, warmup: int, total: int) -> float:

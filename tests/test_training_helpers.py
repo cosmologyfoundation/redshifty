@@ -38,7 +38,7 @@ from src.models.transformer import (
 from src.training.data_split import split_records_by_healpix
 from src.training.eval import evaluate_ar
 from src.training.sequences import tokenize_and_build
-from src.training.utils import compute_masked_metrics
+from src.training.utils import compute_masked_metrics, compute_masked_redshift_acc
 from src.training.wandb_util import init_wandb, log_model_artifact
 
 
@@ -85,17 +85,18 @@ class TestEncoderMasking:
     def test_zero_ratio_no_op(self):
         spec, z = FakeSpecTok(), FakeZTok()
         raw = _make_raw_batch()
-        enc0, dec0, tgt0, mp0 = tokenize_and_build(
+        enc0, dec0, tgt0, mp0, rz0 = tokenize_and_build(
             raw, spec, z, "a", torch.device("cpu"), encoder_mask_ratio=0.0
         )
         assert mp0 is None
+        assert rz0 is None
         # No MASK token should appear in the encoder for this batch
         assert (enc0 == MASK_TOKEN).sum().item() == 0
 
     def test_full_ratio_all_spectrum_positions_masked(self):
         spec, z = FakeSpecTok(n_tokens=8), FakeZTok()
         raw = _make_raw_batch(B=2)
-        enc, dec, tgt, mp = tokenize_and_build(
+        enc, dec, tgt, mp, rz_mask = tokenize_and_build(
             raw, spec, z, "a", torch.device("cpu"), encoder_mask_ratio=1.0
         )
         assert mp is not None
@@ -106,20 +107,22 @@ class TestEncoderMasking:
         # Spectrum positions are 2..2+8 = 2..10
         spec_slice = enc[:, 2:2 + 8]
         assert (spec_slice == MASK_TOKEN).all()
-        # SOS / redshift / EOS are not MASK
+        # SOS / redshift / EOS are not MASK (rz is also masked at ratio=1.0)
         assert (enc[:, 0] == SOS_TOKEN).all()
-        assert (enc[:, 1] >= REDSHIFT_TOKEN_OFFSET).all()
+        assert (enc[:, 1] == MASK_TOKEN).all()  # rz masked at ratio=1.0
         assert (enc[:, -1] == EOS_TOKEN).all()
+        assert rz_mask is not None
+        assert rz_mask.all()
 
     def test_masking_does_not_touch_decoder_or_target(self):
         spec, z = FakeSpecTok(), FakeZTok()
         raw = _make_raw_batch()
         torch.manual_seed(0)
-        _, dec_a, tgt_a, _ = tokenize_and_build(
+        _, dec_a, tgt_a, _, _ = tokenize_and_build(
             raw, spec, z, "a", torch.device("cpu"), encoder_mask_ratio=0.0
         )
         torch.manual_seed(0)
-        _, dec_b, tgt_b, _ = tokenize_and_build(
+        _, dec_b, tgt_b, _, _ = tokenize_and_build(
             raw, spec, z, "a", torch.device("cpu"), encoder_mask_ratio=0.5
         )
         assert torch.equal(dec_a, dec_b)
@@ -128,7 +131,7 @@ class TestEncoderMasking:
     def test_masked_positions_shape_and_dtype(self):
         spec, z = FakeSpecTok(n_tokens=12), FakeZTok()
         raw = _make_raw_batch(B=3)
-        enc, _, _, mp = tokenize_and_build(
+        enc, _, _, mp, _ = tokenize_and_build(
             raw, spec, z, "b", torch.device("cpu"), encoder_mask_ratio=0.3
         )
         assert mp.shape == (3, 12)
@@ -140,13 +143,14 @@ class TestEncoderMasking:
         # 1..1+T in B).
         spec, z = FakeSpecTok(n_tokens=8), FakeZTok()
         raw = _make_raw_batch(B=2)
-        enc, _, _, mp = tokenize_and_build(
+        enc, _, _, mp, rz_mask = tokenize_and_build(
             raw, spec, z, "b", torch.device("cpu"), encoder_mask_ratio=1.0
         )
         # B encoder: [SOS, s1..s8, EOS]
         assert (enc[:, 0] == SOS_TOKEN).all()
         assert (enc[:, 1:1 + 8] == MASK_TOKEN).all()
         assert (enc[:, -1] == EOS_TOKEN).all()
+        assert rz_mask is None
 
 
 # ---------------------------------------------------------------------------
@@ -481,3 +485,138 @@ class TestLogModelArtifactPrune:
         result = log_model_artifact(run, ckpt, "approach_a", keep_only_latest=True)
         assert result is new_art
         # The only existing version equals keep_version → nothing deleted.
+
+
+# ---------------------------------------------------------------------------
+# Redshift masking — tests for stochastic rz masking in Approach A
+# ---------------------------------------------------------------------------
+
+class TestRedshiftMasking:
+    """Tests for stochastic redshift masking in Approach A."""
+
+    def test_zero_ratio_no_rz_mask(self):
+        """encoder_mask_ratio=0.0 should return rz_mask=None."""
+        spec, z = FakeSpecTok(), FakeZTok()
+        raw = _make_raw_batch()
+        enc, dec, tgt, mp, rz_mask = tokenize_and_build(
+            raw, spec, z, "a", torch.device("cpu"), encoder_mask_ratio=0.0
+        )
+        assert rz_mask is None
+
+    def test_full_ratio_all_rz_masked(self):
+        """encoder_mask_ratio=1.0 should mask ALL redshift tokens."""
+        spec, z = FakeSpecTok(n_tokens=8), FakeZTok()
+        raw = _make_raw_batch(B=4)
+        enc, dec, tgt, mp, rz_mask = tokenize_and_build(
+            raw, spec, z, "a", torch.device("cpu"), encoder_mask_ratio=1.0
+        )
+        assert rz_mask is not None
+        assert rz_mask.shape == (4, 1)
+        assert rz_mask.all()
+        # Encoder position 1 (redshift) should be MASK_TOKEN
+        assert (enc[:, 1] == MASK_TOKEN).all()
+        # SOS and EOS should NOT be MASK
+        assert (enc[:, 0] == SOS_TOKEN).all()
+        assert (enc[:, -1] == EOS_TOKEN).all()
+
+    def test_rz_masking_does_not_affect_decoder_or_target(self):
+        """Decoder input and target should be identical regardless of masking."""
+        spec, z = FakeSpecTok(), FakeZTok()
+        raw = _make_raw_batch()
+        torch.manual_seed(0)
+        _, dec_a, tgt_a, _, _ = tokenize_and_build(
+            raw, spec, z, "a", torch.device("cpu"), encoder_mask_ratio=0.5
+        )
+        torch.manual_seed(0)
+        _, dec_b, tgt_b, _, _ = tokenize_and_build(
+            raw, spec, z, "a", torch.device("cpu"), encoder_mask_ratio=0.0
+        )
+        assert torch.equal(dec_a, dec_b)
+        assert torch.equal(tgt_a, tgt_b)
+
+    def test_approach_b_returns_no_rz_mask(self):
+        """Approach B should never return rz_mask (no rz in encoder)."""
+        spec, z = FakeSpecTok(), FakeZTok()
+        raw = _make_raw_batch()
+        enc, dec, tgt, mp, rz_mask = tokenize_and_build(
+            raw, spec, z, "b", torch.device("cpu"), encoder_mask_ratio=0.5
+        )
+        assert rz_mask is None
+
+    def test_stochastic_masking_partial(self):
+        """With ratio=0.5, some samples should be masked, some not."""
+        spec, z = FakeSpecTok(), FakeZTok()
+        raw = _make_raw_batch(B=100)
+        rng = torch.Generator().manual_seed(42)
+        enc, dec, tgt, mp, rz_mask = tokenize_and_build(
+            raw, spec, z, "a", torch.device("cpu"), encoder_mask_ratio=0.5,
+            rng=rng,
+        )
+        assert rz_mask is not None
+        n_masked = int(rz_mask.sum().item())
+        # Should be roughly 50 out of 100 (allow wide margin)
+        assert 20 < n_masked < 80
+
+    def test_encoder_layout_approach_a_with_masking(self):
+        """Encoder layout should be [SOS, rz_or_mask, s1..sN, EOS]."""
+        spec, z = FakeSpecTok(n_tokens=8), FakeZTok()
+        raw = _make_raw_batch(B=2)
+        enc, _, _, _, rz_mask = tokenize_and_build(
+            raw, spec, z, "a", torch.device("cpu"), encoder_mask_ratio=1.0
+        )
+        assert enc.shape == (2, 1 + 1 + 8 + 1)  # SOS + rz + spec + EOS
+        assert (enc[:, 0] == SOS_TOKEN).all()
+        assert (enc[:, 1] == MASK_TOKEN).all()  # rz masked
+        assert (enc[:, 2:10] == MASK_TOKEN).all()  # spectrum also masked at 1.0
+        assert (enc[:, -1] == EOS_TOKEN).all()
+
+
+# ---------------------------------------------------------------------------
+# compute_masked_redshift_acc — tests
+# ---------------------------------------------------------------------------
+
+class TestMaskedRedshiftAcc:
+    """Tests for compute_masked_redshift_acc."""
+
+    def _craft(self, B=2, V=64):
+        logits = torch.zeros(B, 10, V)
+        target = torch.zeros(B, 10, dtype=torch.long)
+        target[:, 0] = 50  # redshift token at position 0
+        target[:, 1:9] = torch.arange(8).unsqueeze(0).expand(B, -1) + 10
+        target[:, -1] = EOS_TOKEN
+        rz_mask = torch.zeros(B, 1, dtype=torch.bool)
+        return logits, target, rz_mask
+
+    def test_all_correct_when_logits_match(self):
+        B = 2
+        logits, target, rz_mask = self._craft()
+        for b in range(B):
+            logits[b, 0, target[b, 0]] = 1.0
+        rz_mask.fill_(True)
+        out = compute_masked_redshift_acc(logits, target, rz_mask)
+        assert out["n_rz_masked"] > 0
+        assert out["redshift_acc_masked"] == pytest.approx(1.0)
+
+    def test_all_wrong(self):
+        logits, target, rz_mask = self._craft(V=64)
+        rz_mask.fill_(True)
+        out = compute_masked_redshift_acc(logits, target, rz_mask)
+        assert out["redshift_acc_masked"] == pytest.approx(0.0)
+
+    def test_zero_mask_returns_nan(self):
+        logits, target, rz_mask = self._craft()
+        out = compute_masked_redshift_acc(logits, target, rz_mask)
+        assert out["n_rz_masked"] == 0
+        assert out["redshift_acc_masked"] != out["redshift_acc_masked"]  # NaN
+
+    def test_partial_mask_only_counts_masked(self):
+        logits, target, rz_mask = self._craft(B=4)
+        # Make logits correct for all
+        for b in range(4):
+            logits[b, 0, target[b, 0]] = 1.0
+        # Only mask half
+        rz_mask[0, 0] = True
+        rz_mask[1, 0] = True
+        out = compute_masked_redshift_acc(logits, target, rz_mask)
+        assert out["n_rz_masked"] == 2
+        assert out["redshift_acc_masked"] == pytest.approx(1.0)

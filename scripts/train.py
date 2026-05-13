@@ -33,6 +33,7 @@ from src.datasets.tokenized_dataset import TokenizedSpectrumDataset, collate_tok
 from src.training.utils import (
     AverageMeter,
     compute_metrics,
+    compute_masked_redshift_acc,
     save_checkpoint,
     load_checkpoint,
     log_metrics,
@@ -78,6 +79,11 @@ def parse_args():
     parser.add_argument('--smoke_test', action='store_true',
                         help='Quick 3-epoch test on small data')
 
+    # Masking
+    parser.add_argument('--encoder_mask_ratio', type=float, default=0.0,
+                        help='Fraction of encoder tokens to mask (BERT-style). '
+                             'Applies to both spectrum and redshift tokens.')
+
     # Pretrained tokenizer
     parser.add_argument('--tokenizer_ckpt', type=str, default=None,
                         help='Path to pretrained SpectrumTokenizer .pt; loads weights before tokenizing')
@@ -122,6 +128,8 @@ def train_epoch(model, dataloader, optimizer, device, grad_clip, log_every):
     
     loss_meter = AverageMeter()
     metrics_accum = {'overall_acc': 0, 'redshift_acc': 0, 'spectrum_acc': 0}
+    rz_masked_correct = 0
+    rz_masked_total = 0
     
     pbar = tqdm(dataloader, desc='Training')
     for batch_idx, batch in enumerate(pbar):
@@ -156,6 +164,12 @@ def train_epoch(model, dataloader, optimizer, device, grad_clip, log_every):
             metrics = compute_metrics(logits, target)
             for k in metrics_accum:
                 metrics_accum[k] += metrics[k]
+            if 'rz_masked' in batch:
+                rz_masked = batch['rz_masked'].to(device)
+                rm = compute_masked_redshift_acc(logits, target, rz_masked.unsqueeze(-1))
+                if rm['n_rz_masked'] > 0:
+                    rz_masked_correct += rm['redshift_acc_masked'] * rm['n_rz_masked']
+                    rz_masked_total += rm['n_rz_masked']
         
         # Update progress bar
         pbar.set_postfix({
@@ -167,6 +181,10 @@ def train_epoch(model, dataloader, optimizer, device, grad_clip, log_every):
     n_batches = len(dataloader)
     for k in metrics_accum:
         metrics_accum[k] /= n_batches
+    if rz_masked_total > 0:
+        metrics_accum['redshift_acc_masked'] = rz_masked_correct / rz_masked_total
+    else:
+        metrics_accum['redshift_acc_masked'] = float('nan')
     
     return loss_meter.avg, metrics_accum
 
@@ -178,6 +196,8 @@ def validate(model, dataloader, device):
     
     loss_meter = AverageMeter()
     metrics_accum = {'overall_acc': 0, 'redshift_acc': 0, 'spectrum_acc': 0}
+    rz_masked_correct = 0
+    rz_masked_total = 0
     
     for batch in tqdm(dataloader, desc='Validation'):
         encoder_input = batch['encoder_input'].to(device)
@@ -199,10 +219,20 @@ def validate(model, dataloader, device):
         metrics = compute_metrics(logits, target)
         for k in metrics_accum:
             metrics_accum[k] += metrics[k]
+        if 'rz_masked' in batch:
+            rz_masked = batch['rz_masked'].to(device)
+            rm = compute_masked_redshift_acc(logits, target, rz_masked.unsqueeze(-1))
+            if rm['n_rz_masked'] > 0:
+                rz_masked_correct += rm['redshift_acc_masked'] * rm['n_rz_masked']
+                rz_masked_total += rm['n_rz_masked']
     
     n_batches = len(dataloader)
     for k in metrics_accum:
         metrics_accum[k] /= n_batches
+    if rz_masked_total > 0:
+        metrics_accum['redshift_acc_masked'] = rz_masked_correct / rz_masked_total
+    else:
+        metrics_accum['redshift_acc_masked'] = float('nan')
     
     return loss_meter.avg, metrics_accum
 
@@ -270,6 +300,7 @@ def main():
         redshift_tokenizer,
         approach=args.approach,
         device=device,
+        encoder_mask_ratio=args.encoder_mask_ratio,
     )
     val_dataset = TokenizedSpectrumDataset(
         val_spectra,
@@ -277,6 +308,7 @@ def main():
         redshift_tokenizer,
         approach=args.approach,
         device=device,
+        encoder_mask_ratio=args.encoder_mask_ratio,
     )
     
     train_loader = DataLoader(

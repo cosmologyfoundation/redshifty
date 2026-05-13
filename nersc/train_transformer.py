@@ -53,6 +53,7 @@ from src.training.sequences import lr_at, tokenize_and_build  # noqa: E402
 from src.training.utils import (  # noqa: E402
     compute_loss_breakdown,
     compute_masked_metrics,
+    compute_masked_redshift_acc,
     compute_metrics,
 )
 from src.training.wandb_util import init_wandb, log_model_artifact, wfinish, wlog  # noqa: E402
@@ -309,7 +310,7 @@ def main():
         for g_ in optim.param_groups:
             g_["lr"] = lr_at(step, args.lr, args.warmup, args.steps)
 
-        enc, dec, tgt, mask_pos = tokenize_and_build(
+        enc, dec, tgt, mask_pos, rz_mask = tokenize_and_build(
             raw, spec_tok, z_tok, args.approach, device,
             encoder_mask_ratio=args.encoder_mask_ratio,
         )
@@ -332,6 +333,9 @@ def main():
                 mm = (compute_masked_metrics(logits, tgt, mask_pos)
                       if mask_pos is not None else
                       {"masked_spec_acc": float("nan"), "n_masked": 0})
+                rm = (compute_masked_redshift_acc(logits, tgt, rz_mask)
+                      if rz_mask is not None else
+                      {"redshift_acc_masked": float("nan"), "n_rz_masked": 0})
             dt = time.time() - t0
             rate = (step + 1) / max(dt, 1e-6)
             msg = {
@@ -340,12 +344,15 @@ def main():
                 **m, **b,
                 "masked_spec_acc": mm["masked_spec_acc"],
                 "n_masked": mm["n_masked"],
+                "redshift_acc_masked": rm["redshift_acc_masked"],
+                "n_rz_masked": rm["n_rz_masked"],
                 "steps_per_sec": rate, "elapsed_s": dt,
             }
             print(f"[step {step:6d}] loss={msg['loss']:.4f} "
                   f"z_loss={b['loss_redshift']:.3f} spec_loss={b['loss_spectrum']:.3f} "
                   f"z_acc={m['redshift_acc']:.3f} spec_acc={m['spectrum_acc']:.3f} "
                   f"masked_acc={mm['masked_spec_acc']:.3f} "
+                  f"rz_masked_acc={rm['redshift_acc_masked']:.3f} "
                   f"{rate:.1f} step/s")
             with metrics_path.open("a") as f:
                 f.write(json.dumps(msg) + "\n")
@@ -359,6 +366,7 @@ def main():
                 "train/redshift_acc": m["redshift_acc"],
                 "train/spectrum_acc": m["spectrum_acc"],
                 "train/masked_spec_acc": mm["masked_spec_acc"],
+                "train/redshift_acc_masked": rm["redshift_acc_masked"],
                 "train/steps_per_sec": rate,
             }, step=step)
 

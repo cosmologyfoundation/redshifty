@@ -28,6 +28,7 @@ from src.training.sequences import tokenize_and_build
 from src.training.utils import (
     compute_loss_breakdown,
     compute_masked_metrics,
+    compute_masked_redshift_acc,
     compute_metrics,
 )
 
@@ -56,13 +57,15 @@ def evaluate(
     breakdown_accum = {"loss_redshift": 0.0, "loss_spectrum": 0.0, "loss_total": 0.0}
     masked_acc_accum = 0.0
     masked_n_total = 0
+    rz_masked_acc_accum = 0.0
+    rz_masked_n_total = 0
     n = 0
     for i, raw in enumerate(loader):
         if raw is None:
             continue
         if i >= max_batches:
             break
-        enc, dec, tgt, mask_pos = tokenize_and_build(
+        enc, dec, tgt, mask_pos, rz_mask = tokenize_and_build(
             raw, spec_tok, z_tok, approach, device,
             encoder_mask_ratio=encoder_mask_ratio,
         )
@@ -81,6 +84,11 @@ def evaluate(
                 # weighted average so positions with more masks count more
                 masked_acc_accum += mm["masked_spec_acc"] * mm["n_masked"]
                 masked_n_total += mm["n_masked"]
+        if rz_mask is not None:
+            rm = compute_masked_redshift_acc(logits, tgt, rz_mask)
+            if rm["n_rz_masked"] > 0:
+                rz_masked_acc_accum += rm["redshift_acc_masked"] * rm["n_rz_masked"]
+                rz_masked_n_total += rm["n_rz_masked"]
         n += 1
 
     if n == 0:
@@ -89,6 +97,7 @@ def evaluate(
                **{k: nan for k in breakdown_accum}}
         if encoder_mask_ratio > 0.0:
             out["masked_spec_acc"] = nan
+            out["redshift_acc_masked"] = nan
         return out
 
     out = {"loss": losses / n, **{k: v / n for k, v in metrics_accum.items()}}
@@ -96,6 +105,9 @@ def evaluate(
     if encoder_mask_ratio > 0.0:
         out["masked_spec_acc"] = (
             masked_acc_accum / masked_n_total if masked_n_total > 0 else float("nan")
+        )
+        out["redshift_acc_masked"] = (
+            rz_masked_acc_accum / rz_masked_n_total if rz_masked_n_total > 0 else float("nan")
         )
     return out
 
@@ -131,7 +143,7 @@ def evaluate_ar(
         if i >= max_batches:
             break
 
-        enc, _dec_unused, tgt, _ = tokenize_and_build(
+        enc, _dec_unused, tgt, _, _ = tokenize_and_build(
             raw, spec_tok, z_tok, approach, device,
             encoder_mask_ratio=encoder_mask_ratio,
         )
