@@ -124,10 +124,10 @@ def parse_args():
     p.add_argument("--amp", action="store_true")
     p.add_argument("--redshift-loss-weight", type=float, default=50.0,
                    help="Multiplier on position-0 (redshift) loss term.")
-    p.add_argument("--encoder-mask-ratio", type=float, default=0.15,
+    p.add_argument("--encoder-mask-ratio", type=float, default=0.50,
                    help="Fraction of encoder spectrum positions to replace "
-                        "with [MASK]. BERT-style. 0.0 disables; 0.15 is "
-                        "BERT canonical. Forces honest spectrum reconstruction.")
+                        "with [MASK]. BERT-style. 0.0 disables; 0.50 recommended "
+                        "for copy prevention. Forces honest spectrum reconstruction.")
     p.add_argument("--ar-eval-batches", type=int, default=4,
                    help="Number of batches to run through autoregressive "
                         "eval at end-of-run and on best checkpoint.")
@@ -354,7 +354,8 @@ def main():
         )
 
         # Decoder corruption (BERT-style): replace random decoder positions with MASK
-        # Forces decoder to generate from cross-attention features, not rely on teacher forcing
+        # and compute loss ONLY on corrupted positions (not teacher-forced)
+        # This forces decoder to generate from cross-attention features, not copy
         if args.decoder_corrupt_ratio > 0.0:
             dec_corrupt_mask = torch.rand_like(dec.float()) < args.decoder_corrupt_ratio
             dec_input_corrupted = dec.clone()

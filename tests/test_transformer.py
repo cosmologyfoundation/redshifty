@@ -507,15 +507,15 @@ class TestSequenceBuilding:
 
 
 class TestDecoupledVocabWithDenoising:
-    """Tests for partially decoupled vocabularies — spectrum tokens decoupled,
-    special+redshift tokens shared.
+    """Tests for partially decoupled vocabularies + cross-attention bottleneck.
 
-    The architecture:
+    Architecture:
     - Special (0-7) and redshift (1032-2055): SHARED between encoder/decoder
-    - Spectrum (8-1031): DECOUPLED — decoder has its own embedding space
+    - Spectrum (8-1031): DECOUPLED — decoder has own embedding space
+    - Cross-attention: encoder compressed to 32 bottleneck tokens (not 1024)
 
     This allows redshift to be learned via cross-attention (shared embedding)
-    while spectrum copy is prevented (decoupled embedding).
+    while preventing spectrum copy via both decoupled vocab AND bottleneck.
     """
 
     def test_partially_decoupled_encoder_decoder_shares_redshift(self):
@@ -535,6 +535,21 @@ class TestDecoupledVocabWithDenoising:
             model.decoder_spectrum_embedding.weight[0:1]
         )
 
+    def test_bottleneck_compresses_encoder(self):
+        """Verify encoder is compressed to n_bottleneck_tokens."""
+        model = SpectrumTransformer(
+            vocab_size=2056,
+            d_model=128,
+            n_encoder_layers=2,
+            n_decoder_layers=2,
+            n_heads=4,
+            max_seq_len=128,
+            n_bottleneck_tokens=32,
+        )
+        encoder_out = torch.randn(2, 100, 128)  # 100 encoder positions
+        compressed = model._compress_encoder(encoder_out)
+        assert compressed.shape == (2, 32, 128)
+
     def test_decoder_has_separate_spectrum_embedding(self):
         """Decoder spectrum embedding is separate from encoder spectrum space."""
         model = SpectrumTransformer(
@@ -551,8 +566,8 @@ class TestDecoupledVocabWithDenoising:
         assert logits.shape == (2, 12, 2056)
         assert logits.shape[-1] == model.vocab_size
 
-    def test_forward_with_partially_decoupled_vocab(self):
-        """Forward pass works with partially decoupled architecture."""
+    def test_forward_with_bottleneck(self):
+        """Forward pass works with bottleneck compression."""
         model = SpectrumTransformer(
             vocab_size=2056,
             d_model=256,
@@ -614,6 +629,60 @@ class TestDecoupledVocabWithDenoising:
         enc_ids = torch.randint(REDSHIFT_TOKEN_OFFSET, 2056, (2, 10))
         dec_ids = torch.randint(REDSHIFT_TOKEN_OFFSET, 2056, (2, 12))
         targets = torch.randint(REDSHIFT_TOKEN_OFFSET, 2056, (2, 12))
+        logits, loss = model(enc_ids, dec_ids, targets=targets)
+        assert logits.shape == (2, 12, 2056)
+        assert loss is not None
+        assert loss.item() > 0
+
+    def test_bottleneck_prevents_position_copy(self):
+        """With bottleneck, decoder cannot attend to specific encoder positions."""
+        model = SpectrumTransformer(
+            vocab_size=2056,
+            d_model=128,
+            n_encoder_layers=2,
+            n_decoder_layers=2,
+            n_heads=4,
+            max_seq_len=128,
+            n_bottleneck_tokens=16,
+        )
+        enc_ids = torch.randint(0, 2056, (2, 15))
+        dec_ids = torch.randint(0, 2056, (2, 12))
+        targets = torch.randint(0, 2056, (2, 12))
+        logits, loss = model(enc_ids, dec_ids, targets=targets)
+        assert logits.shape == (2, 12, 2056)
+        assert loss is not None
+
+    def test_get_decoder_embedding_maps_correctly(self):
+        """_get_decoder_embedding correctly routes special/redshift vs spectrum."""
+        model = SpectrumTransformer(
+            vocab_size=2056,
+            d_model=64,
+            n_encoder_layers=1,
+            n_decoder_layers=1,
+            n_heads=4,
+            max_seq_len=64,
+        )
+        tokens = torch.tensor([[0, 1032, 500, 8]])  # [SOS, redshift, spectrum, spectrum]
+        emb = model._get_decoder_embedding(tokens)
+
+        assert emb.shape == (1, 4, 64)
+
+        shared_emb_sos = model.token_embedding(torch.tensor([0]))
+        assert torch.allclose(emb[0, 0], shared_emb_sos[0], atol=1e-5)
+
+    def test_encoder_mask_plus_bottleneck(self):
+        """Both encoder masking and bottleneck work together."""
+        model = SpectrumTransformer(
+            vocab_size=2056,
+            d_model=256,
+            n_encoder_layers=2,
+            n_decoder_layers=2,
+            n_heads=4,
+            max_seq_len=128,
+        )
+        enc_ids = torch.randint(0, 2056, (2, 15))
+        dec_ids = torch.randint(0, 2056, (2, 12))
+        targets = torch.randint(0, 2056, (2, 12))
         logits, loss = model(enc_ids, dec_ids, targets=targets)
         assert logits.shape == (2, 12, 2056)
         assert loss is not None

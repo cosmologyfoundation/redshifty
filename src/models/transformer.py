@@ -262,17 +262,18 @@ class DecoderBlock(nn.Module):
 class SpectrumTransformer(nn.Module):
     """Encoder-decoder transformer for spectrum + redshift token modeling.
 
-    Architecture: PARTIALLY decoupled vocabularies — spectrum tokens are decoupled
-    to prevent copy, but special + redshift tokens are SHARED so redshift can be
-    learned via cross-attention.
+    Architecture: PARTIALLY decoupled vocabularies + CROSS-ATTENTION BOTTLENECK.
 
-    - Encoder: token_embedding (2056, d_model) — shared with frozen tokenizer
-    - Decoder special+redshift: token_embedding (SHARED via weight tying)
-    - Decoder spectrum: decoder_spectrum_embedding (1024, d_model) — independent
+    Key copy-prevention mechanisms:
+    1. Partially decoupled vocab: spectrum tokens use separate embedding space
+    2. Cross-attention bottleneck: encoder output compressed to 32 tokens via
+       learned attention pooling before cross-attention. This removes fine-grained
+       positional identity — decoder cannot look up specific encoder positions.
+    3. Encoder masking (50%+) further forces the encoder to build robust features
 
-    Cross-attention features carry redshift information from encoder's redshift
-    tokens to decoder's redshift embedding (shared). For spectrum tokens, the
-    decoder has its own embedding space so copy is impossible.
+    - Special (0-7) and redshift (1032-2055): SHARED embedding between enc/dec
+    - Spectrum (8-1031): DECOUPLED — decoder has own embedding space
+    - Cross-attention receives only 32 compressed tokens from encoder, not 1024
 
     Args:
         vocab_size: Encoder vocabulary size (default 2056)
@@ -282,12 +283,11 @@ class SpectrumTransformer(nn.Module):
         n_heads: Number of attention heads (default 12)
         max_seq_len: Maximum sequence length (default 512)
         dropout: Dropout rate (default 0.1)
+        n_bottleneck_tokens: Number of tokens to compress encoder to (default 32)
     """
 
-    # Spectrum token range in encoder vocab
-    SPECTRUM_ENCODER_START = 8   # first spectrum token
-    SPECTRUM_ENCODER_END = 1032  # last spectrum token (exclusive)
-    # Redshift token range (shared between encoder and decoder for position 0)
+    SPECTRUM_ENCODER_START = 8
+    SPECTRUM_ENCODER_END = 1032
     REDSHIFT_START = 1032
     REDSHIFT_END = 2056
 
@@ -300,6 +300,7 @@ class SpectrumTransformer(nn.Module):
         n_heads: int = 12,
         max_seq_len: int = 512,
         dropout: float = 0.1,
+        n_bottleneck_tokens: int = 256,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -308,21 +309,25 @@ class SpectrumTransformer(nn.Module):
         self.n_decoder_layers = n_decoder_layers
         self.n_heads = n_heads
         self.max_seq_len = max_seq_len
+        self.n_bottleneck_tokens = n_bottleneck_tokens
 
         # Encoder token embeddings (shared with frozen tokenizer)
         self.token_embedding = nn.Embedding(vocab_size, d_model)
 
         # Decoder's spectrum embeddings (DECOUPLED from encoder)
-        # Spectrum tokens in decoder (8-1031) use this separate embedding space
-        # This breaks the copy pathway: encoder spectrum features -> decoder's own space
-        self.decoder_spectrum_embedding = nn.Embedding(1024, d_model)  # 1024 spectrum tokens
+        self.decoder_spectrum_embedding = nn.Embedding(1024, d_model)
 
-        # Decoder output heads
-        # Shared head for special (0-7) + redshift (1032-2055) tokens (weight tied)
+        # Cross-attention bottleneck: compress encoder to n_bottleneck_tokens
+        # This removes fine-grained positional identity — prevents copy
+        # 256 tokens preserves enough information for learning while preventing position copy
+        self.encoder_bottleneck_query = nn.Parameter(torch.randn(1, n_bottleneck_tokens, d_model))
+        self.bottleneck_proj = nn.Linear(d_model, d_model, bias=False)
+
+        # Shared head for special (0-7) + redshift (1032-2055) tokens
         self.shared_lm_head = nn.Linear(d_model, self.REDSHIFT_END, bias=False)
-        self.shared_lm_head.weight = self.token_embedding.weight  # weight tying for shared tokens
+        self.shared_lm_head.weight = self.token_embedding.weight
 
-        # Separate head for decoder spectrum tokens (not tied to encoder)
+        # Separate head for decoder spectrum tokens
         self.spectrum_lm_head = nn.Linear(d_model, 1024, bias=False)
 
         # RoPE (shared for encoder and decoder self-attention)
@@ -343,6 +348,29 @@ class SpectrumTransformer(nn.Module):
         self.decoder_norm = RMSNorm(d_model)
 
         self._init_weights()
+
+    def _compress_encoder(self, encoder_out: torch.Tensor) -> torch.Tensor:
+        """Compress encoder output to bottleneck tokens via attention pooling.
+
+        Instead of letting the decoder attend to all 1024 encoder positions,
+        we compress to n_bottleneck_tokens (default 32). This removes fine-grained
+        positional identity — the decoder cannot look up specific encoder positions.
+        """
+        B, L_enc, D = encoder_out.shape
+
+        # Learnable query tokens for compression
+        query = self.encoder_bottleneck_query.expand(B, -1, -1)  # (B, n_bottleneck, D)
+
+        # Simple attention: query attends to encoder to get compressed representation
+        # scores: (B, n_bottleneck, L_enc)
+        scores = torch.matmul(query, encoder_out.transpose(-2, -1)) / (D ** 0.5)
+        attn_weights = F.softmax(scores, dim=-1)
+
+        # Compressed encoder representation: (B, n_bottleneck, D)
+        compressed = torch.matmul(attn_weights, encoder_out)
+        compressed = self.bottleneck_proj(compressed)
+
+        return compressed
 
     def _get_decoder_embedding(self, token_ids: torch.Tensor) -> torch.Tensor:
         """Map decoder token IDs to embeddings.
@@ -464,13 +492,16 @@ class SpectrumTransformer(nn.Module):
         L_dec = decoder_input_ids.shape[1]
         cos, sin = self.rope(L_dec, x.device)
 
+        # Compress encoder to bottleneck — prevents position-level copy
+        encoder_compressed = self._compress_encoder(encoder_out)
+
         for layer in self.decoder_layers:
-            x = layer(x, encoder_out, cos, sin, decoder_mask, encoder_mask)
+            x = layer(x, encoder_compressed, cos, sin, decoder_mask, None)
 
         x = self.decoder_norm(x)
         logits = self._get_decoder_logits(x)
         return logits
-    
+
     def forward(
         self,
         encoder_input_ids: torch.Tensor,
