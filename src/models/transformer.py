@@ -300,7 +300,7 @@ class SpectrumTransformer(nn.Module):
         n_heads: int = 12,
         max_seq_len: int = 512,
         dropout: float = 0.1,
-        n_bottleneck_tokens: int = 256,
+        n_bottleneck_tokens: int = 32,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -318,10 +318,12 @@ class SpectrumTransformer(nn.Module):
         self.decoder_spectrum_embedding = nn.Embedding(1024, d_model)
 
         # Cross-attention bottleneck: compress encoder to n_bottleneck_tokens
-        # This removes fine-grained positional identity — prevents copy
-        # 256 tokens preserves enough information for learning while preventing position copy
-        self.encoder_bottleneck_query = nn.Parameter(torch.randn(1, n_bottleneck_tokens, d_model))
-        self.bottleneck_proj = nn.Linear(d_model, d_model, bias=False)
+        # 32 tokens forces high-level aggregation — prevents fine-grained position copy
+        self.encoder_bottleneck_query = nn.Parameter(torch.randn(1, n_bottleneck_tokens, d_model) * 0.02)
+        self.bottleneck_proj = nn.Sequential(
+            nn.Linear(d_model, d_model, bias=False),
+            nn.LayerNorm(d_model),
+        )
 
         # Shared head for special (0-7) + redshift (1032-2055) tokens
         self.shared_lm_head = nn.Linear(d_model, self.REDSHIFT_END, bias=False)

@@ -325,8 +325,9 @@ def compute_masked_auc(
                 continue
             correct_tok = int(spec_target[b, j].item())
             p_correct = float(spec_probs[b, j, correct_tok].item())
-            # Sample K unique wrong tokens
-            all_toks = list(range(V))
+            # Skip NaN values
+            if not math.isfinite(p_correct):
+                continue
             try:
                 wrong_toks = random.sample(
                     [t for t in all_toks if t != correct_tok],
