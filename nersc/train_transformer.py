@@ -44,7 +44,7 @@ sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE))
 
 # Core logic — moved to src/training/ for reusability.
-from src.models.transformer import SpectrumTransformer, MASK_TOKEN  # noqa: E402
+from src.models.transformer import SpectrumTransformer, MASK_TOKEN, TOTAL_VOCAB_SIZE  # noqa: E402
 from src.tokenizers.redshift import RedshiftTokenizer  # noqa: E402
 from src.tokenizers.redshift_v2 import RedshiftTokenizerV2  # noqa: E402
 from src.tokenizers.spectrum import SpectrumTokenizer  # noqa: E402
