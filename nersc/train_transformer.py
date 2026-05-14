@@ -44,7 +44,7 @@ sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE))
 
 # Core logic — moved to src/training/ for reusability.
-from src.models.transformer import SpectrumTransformer  # noqa: E402
+from src.models.transformer import SpectrumTransformer, MASK_TOKEN  # noqa: E402
 from src.tokenizers.redshift import RedshiftTokenizer  # noqa: E402
 from src.tokenizers.redshift_v2 import RedshiftTokenizerV2  # noqa: E402
 from src.tokenizers.spectrum import SpectrumTokenizer  # noqa: E402
@@ -103,6 +103,15 @@ def parse_args():
     p.add_argument("--n-decoder-layers", type=int, default=6)
     p.add_argument("--n-heads", type=int, default=12)
     p.add_argument("--dropout", type=float, default=0.1)
+    p.add_argument("--decoder-vocab-size", type=int, default=2056,
+                   help="Decoder vocabulary size. Must be >= redshift token count. "
+                        "Default 2056. Use smaller value if decoder generates only redshift "
+                        "(e.g., 262 = 6 special + 256 redshift). Larger matches encoder size.")
+    p.add_argument("--decoder-corrupt-ratio", type=float, default=0.0,
+                   help="Fraction of decoder positions to corrupt with [MASK] during training. "
+                        "BERT-style corruption on decoder input. 0.0 = no corruption (teacher forcing). "
+                        "0.15-0.30 recommended for denoising objective. Forces decoder to generate "
+                        "rather than rely on teacher-forced input.")
 
     # Optim
     p.add_argument("--steps", type=int, default=50_000)
@@ -277,8 +286,10 @@ def main():
         pin_memory=device.type == "cuda",
     )
 
-    # Model
+    # Model — decoupled encoder/decoder vocabularies to prevent copy
     model = SpectrumTransformer(
+        vocab_size=TOTAL_VOCAB_SIZE,
+        decoder_vocab_size=args.decoder_vocab_size,
         d_model=args.d_model,
         n_encoder_layers=args.n_encoder_layers,
         n_decoder_layers=args.n_decoder_layers,
@@ -343,6 +354,19 @@ def main():
             encoder_mask_ratio=args.encoder_mask_ratio,
         )
 
+        # Decoder corruption (BERT-style): replace random decoder positions with MASK
+        # Forces decoder to generate from cross-attention features, not rely on teacher forcing
+        if args.decoder_corrupt_ratio > 0.0:
+            dec_corrupt_mask = torch.rand_like(dec.float()) < args.decoder_corrupt_ratio
+            dec_input_corrupted = dec.clone()
+            dec_input_corrupted[dec_corrupt_mask] = MASK_TOKEN
+            dec_for_loss = dec_input_corrupted
+            tgt_for_loss = tgt.clone()
+            tgt_for_loss[~dec_corrupt_mask] = -100
+        else:
+            dec_for_loss = dec
+            tgt_for_loss = tgt
+
         is_ar_step = (
             args.ar_train_ratio > 0 and
             step >= args.ar_train_start and
@@ -358,7 +382,7 @@ def main():
                     redshift_weight=args.redshift_loss_weight,
                 )
             else:
-                logits, loss = model(enc, dec, targets=tgt,
+                logits, loss = model(enc, dec_for_loss, targets=tgt_for_loss,
                                      redshift_weight=args.redshift_loss_weight)
         scaler.scale(loss).backward()
         if args.grad_clip > 0:

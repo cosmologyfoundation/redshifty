@@ -261,9 +261,19 @@ class DecoderBlock(nn.Module):
 
 class SpectrumTransformer(nn.Module):
     """Encoder-decoder transformer for spectrum + redshift token modeling.
-    
+
+    Architecture: decoupled encoder/decoder vocabularies to prevent copy.
+
+    Encoder and decoder have SEPARATE embedding spaces:
+    - Encoder: token_embedding (vocab_size, d_model) — shared with frozen tokenizer
+    - Decoder: decoder_token_embedding (decoder_vocab_size, d_model) — independently learned
+
+    Cross-attention operates on continuous encoder states, not token IDs.
+    The decoder cannot copy tokens from encoder because they use different embedding spaces.
+
     Args:
-        vocab_size: Total vocabulary size (default 1288)
+        vocab_size: Encoder vocabulary size (default 2056)
+        decoder_vocab_size: Decoder vocabulary size (default 2056, can differ from encoder)
         d_model: Model dimension (default 768)
         n_encoder_layers: Number of encoder layers (default 6)
         n_decoder_layers: Number of decoder layers (default 6)
@@ -275,6 +285,7 @@ class SpectrumTransformer(nn.Module):
     def __init__(
         self,
         vocab_size: int = TOTAL_VOCAB_SIZE,
+        decoder_vocab_size: int = TOTAL_VOCAB_SIZE,
         d_model: int = 768,
         n_encoder_layers: int = 6,
         n_decoder_layers: int = 6,
@@ -284,38 +295,40 @@ class SpectrumTransformer(nn.Module):
     ):
         super().__init__()
         self.vocab_size = vocab_size
+        self.decoder_vocab_size = decoder_vocab_size
         self.d_model = d_model
         self.n_encoder_layers = n_encoder_layers
         self.n_decoder_layers = n_decoder_layers
         self.n_heads = n_heads
         self.max_seq_len = max_seq_len
-        
-        # Shared token embeddings
+
+        # Encoder token embeddings (shared with frozen tokenizer embeddings)
         self.token_embedding = nn.Embedding(vocab_size, d_model)
-        
+
+        # Decoder has its OWN learned embeddings (decoupled from encoder)
+        # This prevents copy: cross-attention operates on continuous states, not token IDs
+        self.decoder_token_embedding = nn.Embedding(decoder_vocab_size, d_model)
+
         # RoPE (shared for encoder and decoder self-attention)
         self.rope = RotaryEmbedding(d_model // n_heads, max_seq_len)
-        
+
         # Encoder
         self.encoder_layers = nn.ModuleList([
             EncoderBlock(d_model, n_heads, dropout)
             for _ in range(n_encoder_layers)
         ])
         self.encoder_norm = RMSNorm(d_model)
-        
+
         # Decoder
         self.decoder_layers = nn.ModuleList([
             DecoderBlock(d_model, n_heads, dropout)
             for _ in range(n_decoder_layers)
         ])
         self.decoder_norm = RMSNorm(d_model)
-        
-        # Output head
-        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
-        
-        # Weight tying
-        self.lm_head.weight = self.token_embedding.weight
-        
+
+        # Decoder output head (separate from encoder embedding - no weight tying)
+        self.decoder_lm_head = nn.Linear(d_model, decoder_vocab_size, bias=False)
+
         self._init_weights()
     
     def _init_weights(self):
@@ -353,26 +366,26 @@ class SpectrumTransformer(nn.Module):
                decoder_mask: Optional[torch.Tensor] = None,
                encoder_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Decode with cross-attention to encoder.
-        
+
         Args:
             decoder_input_ids: (B, L_dec) decoder input token indices
             encoder_out: (B, L_enc, D) encoder output
             decoder_mask: (B, L_dec) optional padding mask
             encoder_mask: (B, L_enc) optional encoder padding mask
-            
+
         Returns:
-            logits: (B, L_dec, vocab_size)
+            logits: (B, L_dec, decoder_vocab_size)
         """
-        x = self.token_embedding(decoder_input_ids)
-        
+        x = self.decoder_token_embedding(decoder_input_ids)
+
         L_dec = decoder_input_ids.shape[1]
         cos, sin = self.rope(L_dec, x.device)
-        
+
         for layer in self.decoder_layers:
             x = layer(x, encoder_out, cos, sin, decoder_mask, encoder_mask)
-        
+
         x = self.decoder_norm(x)
-        logits = self.lm_head(x)
+        logits = self.decoder_lm_head(x)
         return logits
     
     def forward(
@@ -402,7 +415,7 @@ class SpectrumTransformer(nn.Module):
                 position count.
 
         Returns:
-            logits: (B, L_dec, vocab_size)
+            logits: (B, L_dec, decoder_vocab_size)
             loss: scalar cross-entropy loss (if targets provided)
         """
         assert encoder_input_ids.shape[1] <= self.max_seq_len
@@ -418,7 +431,7 @@ class SpectrumTransformer(nn.Module):
         if targets is not None:
             B, L = targets.shape
             per_token = F.cross_entropy(
-                logits.view(-1, self.vocab_size),
+                logits.view(-1, self.decoder_vocab_size),
                 targets.view(-1),
                 ignore_index=-100,
                 reduction="none",
@@ -479,7 +492,7 @@ class SpectrumTransformer(nn.Module):
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = float('-inf')
-            
+
             # Top-p filtering
             if top_p is not None:
                 sorted_logits, sorted_indices = torch.sort(logits, descending=True)
@@ -489,18 +502,18 @@ class SpectrumTransformer(nn.Module):
                 sorted_indices_to_remove[..., 0] = 0
                 indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
                 logits[indices_to_remove] = float('-inf')
-            
-            # Sample
+
+            # Sample from decoder vocabulary
             probs = F.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
-            
+
             # Append
             decoder_input_ids = torch.cat([decoder_input_ids, next_token], dim=1)
-            
+
             # Stop if all EOS
             if (next_token == EOS_TOKEN).all():
                 break
-        
+
         return decoder_input_ids
 
     def ar_loss(
@@ -525,7 +538,7 @@ class SpectrumTransformer(nn.Module):
             redshift_weight: weight on position-0 (redshift) loss
 
         Returns:
-            logits: (B, L, V) full logits sequence for logging/metrics
+            logits: (B, L, decoder_vocab_size) full logits sequence for logging/metrics
             loss: scalar loss (AR loss only)
         """
         B = encoder_input_ids.shape[0]
@@ -553,7 +566,7 @@ class SpectrumTransformer(nn.Module):
         targets_trunc = targets[:, 1:T+1]
 
         per_token = F.cross_entropy(
-            logits_trunc.reshape(-1, self.vocab_size),
+            logits_trunc.reshape(-1, self.decoder_vocab_size),
             targets_trunc.reshape(-1),
             ignore_index=-100,
             reduction='none',
@@ -565,7 +578,7 @@ class SpectrumTransformer(nn.Module):
         loss_spec = (per_token[:, 1:] * valid[:, 1:]).sum() / n_spec if T > 1 else torch.tensor(0.0, device=per_token.device)
         loss = redshift_weight * loss_red + loss_spec
 
-        logits_full = torch.zeros(B, targets.shape[1], self.vocab_size, device=logits_stacked.device)
+        logits_full = torch.zeros(B, targets.shape[1], self.decoder_vocab_size, device=logits_stacked.device)
         logits_full[:, :logits_stacked.shape[1], :] = logits_stacked
 
         return logits_full, loss

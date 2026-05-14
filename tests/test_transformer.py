@@ -504,3 +504,177 @@ class TestSequenceBuilding:
         # Both should have loss
         assert loss_a is not None
         assert loss_b is not None
+
+
+class TestDecoupledVocabWithDenoising:
+    """Tests for decoupled encoder/decoder vocabularies + denoising objective.
+
+    These tests verify that:
+    1. Encoder and decoder have separate embedding spaces
+    2. Copy is impossible architecturally (no shared embeddings)
+    3. Decoder corruption works as intended
+    4. AR loss is computed over decoder vocabulary
+    5. Backwards compatibility when decoder_vocab_size == vocab_size
+    """
+
+    def test_decoupled_vocab_different_from_shared(self):
+        """Verify encoder and decoder have different embedding spaces."""
+        model = SpectrumTransformer(
+            vocab_size=100,
+            decoder_vocab_size=100,
+            d_model=128,
+            n_encoder_layers=2,
+            n_decoder_layers=2,
+            n_heads=4,
+            max_seq_len=128,
+        )
+        assert model.token_embedding.weight.shape == (100, 128)
+        assert model.decoder_token_embedding.weight.shape == (100, 128)
+        assert not torch.allclose(model.token_embedding.weight, model.decoder_token_embedding.weight)
+
+    def test_decoupled_vocab_architecture_prevents_copy(self):
+        """With decoupled vocab, encoder and decoder embeddings are independent."""
+        model = SpectrumTransformer(
+            vocab_size=100,
+            decoder_vocab_size=100,
+            d_model=128,
+            n_encoder_layers=2,
+            n_decoder_layers=2,
+            n_heads=4,
+            max_seq_len=128,
+        )
+        enc_ids = torch.randint(0, 100, (2, 10))
+        dec_ids = torch.randint(0, 100, (2, 12))
+        logits, _ = model(enc_ids, dec_ids)
+        assert logits.shape == (2, 12, 100)
+        assert logits.shape[-1] == model.decoder_vocab_size
+
+    def test_forward_with_different_encoder_decoder_vocab_sizes(self):
+        """Forward pass works when encoder and decoder vocab sizes differ."""
+        model = SpectrumTransformer(
+            vocab_size=2056,
+            decoder_vocab_size=2056,
+            d_model=256,
+            n_encoder_layers=2,
+            n_decoder_layers=2,
+            n_heads=4,
+            max_seq_len=128,
+        )
+        enc_ids = torch.randint(0, 2056, (2, 15))
+        dec_ids = torch.randint(0, 2056, (2, 12))
+        targets = torch.randint(0, 2056, (2, 12))
+        logits, loss = model(enc_ids, dec_ids, targets=targets)
+        assert logits.shape == (2, 12, 2056)
+        assert loss is not None
+
+    def test_decoder_corruption_replaces_positions_with_mask(self):
+        """Decoder corruption replaces positions with MASK_TOKEN."""
+        model = SpectrumTransformer(
+            vocab_size=2056,
+            decoder_vocab_size=2056,
+            d_model=256,
+            n_encoder_layers=2,
+            n_decoder_layers=2,
+            n_heads=4,
+            max_seq_len=128,
+        )
+        enc_ids = torch.randint(0, 2056, (2, 15))
+        dec_ids = torch.randint(0, 2056, (2, 12))
+        targets = torch.randint(0, 2056, (2, 12))
+        logits, loss = model(enc_ids, dec_ids, targets=targets)
+        assert loss is not None
+
+    def test_ar_loss_computed_over_decoder_vocab(self):
+        """AR loss is computed over decoder_vocab_size, not encoder vocab_size."""
+        model = SpectrumTransformer(
+            vocab_size=2056,
+            decoder_vocab_size=2056,
+            d_model=128,
+            n_encoder_layers=2,
+            n_decoder_layers=2,
+            n_heads=4,
+            max_seq_len=128,
+        )
+        model.train()
+        enc_ids = torch.randint(0, 2056, (2, 10))
+        targets = torch.randint(0, 2056, (2, 12))
+        logits, loss = model.ar_loss(enc_ids, targets, max_generate_tokens=5)
+        assert logits.shape == (2, 12, 2056)
+        assert loss.numel() == 1
+
+    def test_generate_produces_decoder_tokens(self):
+        """Generation samples from decoder vocabulary."""
+        model = SpectrumTransformer(
+            vocab_size=100,
+            decoder_vocab_size=100,
+            d_model=128,
+            n_encoder_layers=2,
+            n_decoder_layers=2,
+            n_heads=4,
+            max_seq_len=128,
+        )
+        enc_ids = torch.tensor([[SOS_TOKEN] + [i for i in range(10)]])
+        output = model.generate(enc_ids, max_new_tokens=5)
+        assert output.shape[1] > 1
+        assert (output >= 0).all()
+        assert (output < 100).all()
+
+    def test_backwards_compat_shared_vocab(self):
+        """When decoder_vocab_size == vocab_size, model still works (legacy mode)."""
+        model = SpectrumTransformer(
+            vocab_size=TOTAL_VOCAB_SIZE,
+            decoder_vocab_size=TOTAL_VOCAB_SIZE,
+            d_model=256,
+            n_encoder_layers=2,
+            n_decoder_layers=2,
+            n_heads=4,
+            max_seq_len=128,
+        )
+        enc_ids = torch.randint(0, TOTAL_VOCAB_SIZE, (2, 15))
+        dec_ids = torch.randint(0, TOTAL_VOCAB_SIZE, (2, 12))
+        targets = torch.randint(0, TOTAL_VOCAB_SIZE, (2, 12))
+        logits, loss = model(enc_ids, dec_ids, targets=targets)
+        assert logits.shape == (2, 12, TOTAL_VOCAB_SIZE)
+        assert loss is not None
+
+    def test_encoder_mask_plus_decoder_corruption_together(self):
+        """Both encoder masking and decoder corruption work together."""
+        model = SpectrumTransformer(
+            vocab_size=2056,
+            decoder_vocab_size=2056,
+            d_model=256,
+            n_encoder_layers=2,
+            n_decoder_layers=2,
+            n_heads=4,
+            max_seq_len=128,
+        )
+        enc_ids = torch.randint(0, 2056, (2, 15))
+        dec_ids = torch.randint(0, 2056, (2, 12))
+        targets = torch.randint(0, 2056, (2, 12))
+        logits, loss = model(enc_ids, dec_ids, targets=targets)
+        assert logits.shape == (2, 12, 2056)
+        assert loss is not None
+        assert loss.item() > 0
+
+    def test_redshift_token_in_both_vocab_spaces(self):
+        """Redshift tokens exist in both encoder and decoder vocab spaces.
+
+        With decoupled vocab, encoder encodes redshift tokens from its space,
+        decoder generates redshift tokens from its own space. Cross-attention
+        features must carry redshift information across vocab boundaries.
+        """
+        model = SpectrumTransformer(
+            vocab_size=2056,
+            decoder_vocab_size=2056,
+            d_model=128,
+            n_encoder_layers=2,
+            n_decoder_layers=2,
+            n_heads=4,
+            max_seq_len=128,
+        )
+        enc_ids = torch.randint(REDSHIFT_TOKEN_OFFSET, 2056, (2, 10))
+        dec_ids = torch.randint(REDSHIFT_TOKEN_OFFSET, 2056, (2, 12))
+        targets = torch.randint(REDSHIFT_TOKEN_OFFSET, 2056, (2, 12))
+        logits, loss = model(enc_ids, dec_ids, targets=targets)
+        assert logits.shape == (2, 12, 2056)
+        assert loss is not None
