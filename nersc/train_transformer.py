@@ -46,7 +46,9 @@ sys.path.insert(0, str(HERE))
 # Core logic — moved to src/training/ for reusability.
 from src.models.transformer import SpectrumTransformer  # noqa: E402
 from src.tokenizers.redshift import RedshiftTokenizer  # noqa: E402
+from src.tokenizers.redshift_v2 import RedshiftTokenizerV2  # noqa: E402
 from src.tokenizers.spectrum import SpectrumTokenizer  # noqa: E402
+from src.tokenizers.spectrum_v2 import SpectrumTokenizerV2  # noqa: E402
 from src.training.data_split import split_records_by_healpix  # noqa: E402
 from src.training.eval import evaluate, evaluate_ar  # noqa: E402
 from src.training.sequences import lr_at, tokenize_and_build  # noqa: E402
@@ -77,6 +79,13 @@ def parse_args():
     p.add_argument("--manifest", type=Path, required=True)
     p.add_argument("--tokenizer-ckpt", type=Path, required=True,
                    help="Pretrained SpectrumTokenizer .pt (best.pt or final.pt)")
+    p.add_argument("--tokenizer-kind", choices=["v1", "v2"], default="v1",
+                   help="Spectrum tokenizer version: v1 (ConvNeXt-V2 + LFQ, val_recon=1.35) "
+                        "or v2 (U-Net + cross-attn + entropy loss, val_recon=0.157). "
+                        "Default v1.")
+    p.add_argument("--redshift-levels", type=int, default=256,
+                   help="Number of FSQ levels for RedshiftTokenizer. "
+                        "V1 default 256. V2 default 1024.")
     p.add_argument("--max-spectra", type=int, default=None)
     p.add_argument("--healpix-holdout-frac", type=float, default=0.05,
                    help="Fraction of HEALPIX FILES (not rows) to reserve "
@@ -201,8 +210,11 @@ def main():
           f"{len(val_records)} val (frac={args.healpix_holdout_frac})")
 
     # Pretrained spectrum tokenizer (lives on GPU in main process; never forked)
-    print(f"[tok] loading spectrum tokenizer {args.tokenizer_ckpt}")
-    spec_tok = SpectrumTokenizer().to(device)
+    print(f"[tok] loading spectrum tokenizer {args.tokenizer_ckpt} (kind={args.tokenizer_kind})")
+    if args.tokenizer_kind == "v2":
+        spec_tok = SpectrumTokenizerV2().to(device)
+    else:
+        spec_tok = SpectrumTokenizer().to(device)
     ckpt = torch.load(args.tokenizer_ckpt, map_location=device, weights_only=False)
     sd = ckpt.get("model", ckpt) if isinstance(ckpt, dict) else ckpt
     spec_tok.load_state_dict(sd)
@@ -214,7 +226,10 @@ def main():
     print(f"[tok] fitting redshift tokenizer on up to {args.z_fit_files} redrock files")
     zs = collect_redshifts(train_records, max_files=args.z_fit_files)
     print(f"[tok]   gathered {len(zs)} z values, min={zs.min():.4f} max={zs.max():.4f}")
-    z_tok = RedshiftTokenizer(n_levels=256)
+    if args.tokenizer_kind == "v2":
+        z_tok = RedshiftTokenizerV2(n_levels=1024, d_model=args.d_model)
+    else:
+        z_tok = RedshiftTokenizer(n_levels=args.redshift_levels)
     z_tok.fit(zs)
 
     # Build separate datasets for each partition.
