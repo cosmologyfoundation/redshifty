@@ -503,6 +503,73 @@ class SpectrumTransformer(nn.Module):
         
         return decoder_input_ids
 
+    def ar_loss(
+        self,
+        encoder_input_ids: torch.Tensor,
+        targets: torch.Tensor,
+        max_generate_tokens: int = 50,
+        redshift_weight: float = 1.0,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute autoregressive loss (full AR, no teacher forcing).
+
+        For each position t, the model predicts tokens[0..t] given
+        encoder_output and the model's own previous predictions (no teacher forcing).
+
+        This is expensive but gives an honest training metric that matches
+        the AR eval behavior.
+
+        Args:
+            encoder_input_ids: (B, L_enc) encoder input
+            targets: (B, L_dec) target tokens [redshift, s1, s2, ..., sN, EOS]
+            max_generate_tokens: truncate generation at this many tokens (for speed)
+            redshift_weight: weight on position-0 (redshift) loss
+
+        Returns:
+            logits: (B, L, V) full logits sequence for logging/metrics
+            loss: scalar loss (AR loss only)
+        """
+        B = encoder_input_ids.shape[0]
+
+        encoder_out = self.encode(encoder_input_ids)
+
+        gen_tokens = [[SOS_TOKEN] for _ in range(B)]
+        all_logits = []
+
+        max_len = min(targets.shape[1], max_generate_tokens + 1)
+
+        for pos in range(max_len - 1):
+            decoder_ids = torch.tensor(gen_tokens, dtype=torch.long, device=encoder_input_ids.device)
+            logits = self.decode(decoder_ids, encoder_out)
+            all_logits.append(logits[:, -1:, :])
+
+            next_token_logits = logits[:, -1:, :].argmax(dim=-1).squeeze(-1).tolist()
+            for i in range(B):
+                gen_tokens[i].append(next_token_logits[i])
+
+        logits_stacked = torch.cat(all_logits, dim=1)
+
+        T = min(logits_stacked.shape[1], targets.shape[1] - 1)
+        logits_trunc = logits_stacked[:, :T, :]
+        targets_trunc = targets[:, 1:T+1]
+
+        per_token = F.cross_entropy(
+            logits_trunc.reshape(-1, self.vocab_size),
+            targets_trunc.reshape(-1),
+            ignore_index=-100,
+            reduction='none',
+        ).view(B, T)
+        valid = (targets_trunc != -100).float()
+        n_red = valid[:, 0].sum().clamp(min=1.0)
+        n_spec = valid[:, 1:].sum().clamp(min=1.0) if T > 1 else torch.tensor(1.0, device=valid.device)
+        loss_red = (per_token[:, 0] * valid[:, 0]).sum() / n_red
+        loss_spec = (per_token[:, 1:] * valid[:, 1:]).sum() / n_spec if T > 1 else torch.tensor(0.0, device=per_token.device)
+        loss = redshift_weight * loss_red + loss_spec
+
+        logits_full = torch.zeros(B, targets.shape[1], self.vocab_size, device=logits_stacked.device)
+        logits_full[:, :logits_stacked.shape[1], :] = logits_stacked
+
+        return logits_full, loss
+
 
 # Token encoding/decoding helpers (unchanged)
 def encode_spectrum_token(lfq_index: torch.Tensor) -> torch.Tensor:

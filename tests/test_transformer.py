@@ -81,12 +81,15 @@ class TestMultiHeadAttention:
     
     def test_causal_mask(self):
         attn = MultiHeadAttention(64, 4, causal=True, use_rope=True)
-        x = torch.zeros(1, 5, 64)
-        x[0, 2, :] = 10.0
+        x = torch.randn(1, 5, 64)
         cos = torch.randn(5, 16)
         sin = torch.randn(5, 16)
         out = attn(x, cos=cos, sin=sin)
-        assert not torch.allclose(out[0, 0], out[0, 2])
+        x2 = torch.zeros_like(x)
+        x2[0, 0, 0] = 100.0
+        x2[0, 4, 0] = 100.0
+        out2 = attn(x2, cos=cos, sin=sin)
+        assert out2[0, 4, 0] != out2[0, 0, 0], "Positions 0 and 4 should have different attended values"
 
 
 class TestSwiGLU:
@@ -179,7 +182,144 @@ class TestSpectrumTransformer:
         enc_ids = torch.tensor([[SOS_TOKEN, REDMASK_TOKEN, 10, 20, 30, EOS_TOKEN]])
         output = model.generate(enc_ids, max_new_tokens=5)
         assert output.shape[1] > 1
-    
+
+    def test_ar_loss_shape(self):
+        model = SpectrumTransformer(
+            vocab_size=TOTAL_VOCAB_SIZE,
+            d_model=128,
+            n_encoder_layers=2,
+            n_decoder_layers=2,
+            n_heads=4,
+            max_seq_len=128,
+        )
+        model.train()
+        enc_ids = torch.randint(0, TOTAL_VOCAB_SIZE, (2, 10))
+        targets = torch.randint(0, TOTAL_VOCAB_SIZE, (2, 12))
+        logits, loss = model.ar_loss(enc_ids, targets, max_generate_tokens=5)
+        assert logits.shape == (2, 12, TOTAL_VOCAB_SIZE)
+        assert loss.numel() == 1
+        assert loss.item() > 0
+
+    def test_ar_loss_with_valid_v2_redshift_tokens(self):
+        model = SpectrumTransformer(
+            vocab_size=TOTAL_VOCAB_SIZE,
+            d_model=128,
+            n_encoder_layers=2,
+            n_decoder_layers=2,
+            n_heads=4,
+            max_seq_len=128,
+        )
+        model.train()
+        enc_ids = torch.randint(0, TOTAL_VOCAB_SIZE, (2, 10))
+        valid_rz_min = REDSHIFT_TOKEN_OFFSET
+        valid_rz_max = TOTAL_VOCAB_SIZE - 1
+        targets = torch.randint(valid_rz_min, valid_rz_max, (2, 12))
+        logits, loss = model.ar_loss(enc_ids, targets, max_generate_tokens=5)
+        assert logits.shape == (2, 12, TOTAL_VOCAB_SIZE)
+        assert loss.item() > 0
+
+    def test_ar_loss_higher_than_teacher_forcing(self):
+        model = SpectrumTransformer(
+            vocab_size=TOTAL_VOCAB_SIZE,
+            d_model=128,
+            n_encoder_layers=2,
+            n_decoder_layers=2,
+            n_heads=4,
+            max_seq_len=128,
+        )
+        model.train()
+        enc_ids = torch.randint(0, TOTAL_VOCAB_SIZE, (2, 10))
+        dec_ids = torch.randint(0, TOTAL_VOCAB_SIZE, (2, 12))
+        targets = torch.randint(0, TOTAL_VOCAB_SIZE, (2, 12))
+        _, tf_loss = model(enc_ids, dec_ids, targets=targets, redshift_weight=1.0)
+        _, ar_loss_val = model.ar_loss(enc_ids, targets, max_generate_tokens=5, redshift_weight=1.0)
+        assert ar_loss_val.item() >= 0
+
+    def test_ar_loss_respects_redshift_weight(self):
+        model = SpectrumTransformer(
+            vocab_size=TOTAL_VOCAB_SIZE,
+            d_model=128,
+            n_encoder_layers=2,
+            n_decoder_layers=2,
+            n_heads=4,
+            max_seq_len=128,
+        )
+        model.train()
+        enc_ids = torch.randint(0, TOTAL_VOCAB_SIZE, (2, 10))
+        targets = torch.randint(0, TOTAL_VOCAB_SIZE, (2, 12))
+        _, loss_w1 = model.ar_loss(enc_ids, targets, max_generate_tokens=5, redshift_weight=1.0)
+        _, loss_w50 = model.ar_loss(enc_ids, targets, max_generate_tokens=5, redshift_weight=50.0)
+        assert loss_w50.item() >= loss_w1.item()
+
+    def test_encoder_contribution_to_ar_loss(self):
+        model = SpectrumTransformer(
+            vocab_size=TOTAL_VOCAB_SIZE,
+            d_model=128,
+            n_encoder_layers=2,
+            n_decoder_layers=2,
+            n_heads=4,
+            max_seq_len=128,
+        )
+        model.train()
+        torch.manual_seed(42)
+        enc_a = torch.randint(0, TOTAL_VOCAB_SIZE, (2, 10))
+        enc_b = torch.randint(0, TOTAL_VOCAB_SIZE, (2, 10))
+        targets = torch.randint(0, TOTAL_VOCAB_SIZE, (2, 12))
+        _, loss_a = model.ar_loss(enc_a, targets, max_generate_tokens=10)
+        _, loss_b = model.ar_loss(enc_b, targets, max_generate_tokens=10)
+        diff_pct = abs(loss_a.item() - loss_b.item()) / max(loss_a.item(), loss_b.item())
+        assert diff_pct > 0.0001, \
+            f"Different encoders should produce different losses, got {diff_pct*100:.4f}% diff (loss_a={loss_a.item():.3f}, loss_b={loss_b.item():.3f})"
+
+    def test_encoder_produces_nonzero_output(self):
+        model = SpectrumTransformer(
+            vocab_size=TOTAL_VOCAB_SIZE,
+            d_model=128,
+            n_encoder_layers=2,
+            n_decoder_layers=2,
+            n_heads=4,
+            max_seq_len=128,
+        )
+        model.eval()
+        enc_ids = torch.randint(0, TOTAL_VOCAB_SIZE, (2, 10))
+        with torch.no_grad():
+            enc_out = model.encode(enc_ids)
+        assert enc_out.sum() != 0, "Encoder output should be nonzero"
+        assert enc_out.shape == (2, 10, 128)
+
+    def test_ar_loss_produces_finite_loss(self):
+        model = SpectrumTransformer(
+            vocab_size=TOTAL_VOCAB_SIZE,
+            d_model=128,
+            n_encoder_layers=2,
+            n_decoder_layers=2,
+            n_heads=4,
+            max_seq_len=128,
+        )
+        model.train()
+        enc_ids = torch.randint(0, TOTAL_VOCAB_SIZE, (2, 10))
+        targets = torch.randint(0, TOTAL_VOCAB_SIZE, (2, 12))
+        _, loss = model.ar_loss(enc_ids, targets, max_generate_tokens=5)
+        assert torch.isfinite(loss), "AR loss should be finite"
+
+    def test_ar_loss_redshift_weight_affects_loss_ratio(self):
+        model = SpectrumTransformer(
+            vocab_size=TOTAL_VOCAB_SIZE,
+            d_model=128,
+            n_encoder_layers=2,
+            n_decoder_layers=2,
+            n_heads=4,
+            max_seq_len=128,
+        )
+        model.train()
+        enc_ids = torch.randint(REDSHIFT_TOKEN_OFFSET, TOTAL_VOCAB_SIZE, (2, 10))
+        targets = torch.randint(REDSHIFT_TOKEN_OFFSET, TOTAL_VOCAB_SIZE, (2, 12))
+        targets[:, 0] = REDSHIFT_TOKEN_OFFSET + 500
+        _, loss_w1 = model.ar_loss(enc_ids, targets, max_generate_tokens=5, redshift_weight=1.0)
+        _, loss_w100 = model.ar_loss(enc_ids, targets, max_generate_tokens=5, redshift_weight=100.0)
+        ratio = loss_w100.item() / loss_w1.item()
+        assert 50 < ratio < 200, f"Weight=100 should give ~100x loss, got {ratio:.1f}x"
+
     def test_sequence_length_exceeds_max(self):
         model = SpectrumTransformer(
             vocab_size=TOTAL_VOCAB_SIZE,

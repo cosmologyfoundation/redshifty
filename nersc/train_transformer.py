@@ -122,6 +122,15 @@ def parse_args():
     p.add_argument("--ar-eval-batches", type=int, default=4,
                    help="Number of batches to run through autoregressive "
                         "eval at end-of-run and on best checkpoint.")
+    p.add_argument("--ar-train-ratio", type=float, default=0.0,
+                   help="Fraction of training steps that use full autoregressive "
+                        "loss instead of teacher forcing. 0.0 = pure teacher forcing. "
+                        "Schedules from 0 to this value after --ar-train-start steps. "
+                        "Helps close the train/val gap by training on model own predictions.")
+    p.add_argument("--ar-train-start", type=int, default=5000,
+                   help="Start AR training after this many steps (allow encoder to learn first).")
+    p.add_argument("--ar-max-tokens", type=int, default=50,
+                   help="Max tokens to generate during AR training (truncated for speed).")
 
     # Logging
     p.add_argument("--run-name", type=str, default="approach_a")
@@ -334,10 +343,23 @@ def main():
             encoder_mask_ratio=args.encoder_mask_ratio,
         )
 
+        is_ar_step = (
+            args.ar_train_ratio > 0 and
+            step >= args.ar_train_start and
+            step % 100 < int(args.ar_train_ratio * 100)
+        )
+
         optim.zero_grad(set_to_none=True)
         with torch.amp.autocast("cuda", enabled=args.amp):
-            logits, loss = model(enc, dec, targets=tgt,
-                                 redshift_weight=args.redshift_loss_weight)
+            if is_ar_step:
+                logits, loss = model.ar_loss(
+                    enc, tgt,
+                    max_generate_tokens=args.ar_max_tokens,
+                    redshift_weight=args.redshift_loss_weight,
+                )
+            else:
+                logits, loss = model(enc, dec, targets=tgt,
+                                     redshift_weight=args.redshift_loss_weight)
         scaler.scale(loss).backward()
         if args.grad_clip > 0:
             scaler.unscale_(optim)
@@ -368,6 +390,7 @@ def main():
             msg = {
                 "kind": "train", "step": step, "lr": optim.param_groups[0]["lr"],
                 "loss": float(loss.item()),
+                "is_ar": is_ar_step,
                 **m, **b,
                 "masked_spec_acc": mm["masked_spec_acc"],
                 "n_masked": mm["n_masked"],
@@ -379,7 +402,8 @@ def main():
                 "all_spec_r2": ar["all_spec_r2"],
                 "steps_per_sec": rate, "elapsed_s": dt,
             }
-            print(f"[step {step:6d}] loss={msg['loss']:.4f} "
+            ar_tag = " [AR]" if is_ar_step else ""
+            print(f"[step {step:6d}{ar_tag}] loss={msg['loss']:.4f} "
                   f"z_loss={b['loss_redshift']:.3f} spec_loss={b['loss_spectrum']:.3f} "
                   f"z_acc={m['redshift_acc']:.3f} spec_acc={m['spectrum_acc']:.3f} "
                   f"masked_acc={mm['masked_spec_acc']:.3f} "
