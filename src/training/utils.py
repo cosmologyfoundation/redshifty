@@ -2,6 +2,7 @@
 Training utilities for spectrum transformer.
 """
 
+import math
 import os
 import json
 import random
