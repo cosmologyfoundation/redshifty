@@ -329,6 +329,7 @@ def compute_masked_auc(
             # Skip NaN values
             if not math.isfinite(p_correct):
                 continue
+            all_toks = list(range(V))
             try:
                 wrong_toks = random.sample(
                     [t for t in all_toks if t != correct_tok],
