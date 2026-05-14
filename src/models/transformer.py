@@ -262,18 +262,20 @@ class DecoderBlock(nn.Module):
 class SpectrumTransformer(nn.Module):
     """Encoder-decoder transformer for spectrum + redshift token modeling.
 
-    Architecture: decoupled encoder/decoder vocabularies to prevent copy.
+    Architecture: PARTIALLY decoupled vocabularies — spectrum tokens are decoupled
+    to prevent copy, but special + redshift tokens are SHARED so redshift can be
+    learned via cross-attention.
 
-    Encoder and decoder have SEPARATE embedding spaces:
-    - Encoder: token_embedding (vocab_size, d_model) — shared with frozen tokenizer
-    - Decoder: decoder_token_embedding (decoder_vocab_size, d_model) — independently learned
+    - Encoder: token_embedding (2056, d_model) — shared with frozen tokenizer
+    - Decoder special+redshift: token_embedding (SHARED via weight tying)
+    - Decoder spectrum: decoder_spectrum_embedding (1024, d_model) — independent
 
-    Cross-attention operates on continuous encoder states, not token IDs.
-    The decoder cannot copy tokens from encoder because they use different embedding spaces.
+    Cross-attention features carry redshift information from encoder's redshift
+    tokens to decoder's redshift embedding (shared). For spectrum tokens, the
+    decoder has its own embedding space so copy is impossible.
 
     Args:
         vocab_size: Encoder vocabulary size (default 2056)
-        decoder_vocab_size: Decoder vocabulary size (default 2056, can differ from encoder)
         d_model: Model dimension (default 768)
         n_encoder_layers: Number of encoder layers (default 6)
         n_decoder_layers: Number of decoder layers (default 6)
@@ -281,11 +283,17 @@ class SpectrumTransformer(nn.Module):
         max_seq_len: Maximum sequence length (default 512)
         dropout: Dropout rate (default 0.1)
     """
-    
+
+    # Spectrum token range in encoder vocab
+    SPECTRUM_ENCODER_START = 8   # first spectrum token
+    SPECTRUM_ENCODER_END = 1032  # last spectrum token (exclusive)
+    # Redshift token range (shared between encoder and decoder for position 0)
+    REDSHIFT_START = 1032
+    REDSHIFT_END = 2056
+
     def __init__(
         self,
         vocab_size: int = TOTAL_VOCAB_SIZE,
-        decoder_vocab_size: int = TOTAL_VOCAB_SIZE,
         d_model: int = 768,
         n_encoder_layers: int = 6,
         n_decoder_layers: int = 6,
@@ -295,19 +303,27 @@ class SpectrumTransformer(nn.Module):
     ):
         super().__init__()
         self.vocab_size = vocab_size
-        self.decoder_vocab_size = decoder_vocab_size
         self.d_model = d_model
         self.n_encoder_layers = n_encoder_layers
         self.n_decoder_layers = n_decoder_layers
         self.n_heads = n_heads
         self.max_seq_len = max_seq_len
 
-        # Encoder token embeddings (shared with frozen tokenizer embeddings)
+        # Encoder token embeddings (shared with frozen tokenizer)
         self.token_embedding = nn.Embedding(vocab_size, d_model)
 
-        # Decoder has its OWN learned embeddings (decoupled from encoder)
-        # This prevents copy: cross-attention operates on continuous states, not token IDs
-        self.decoder_token_embedding = nn.Embedding(decoder_vocab_size, d_model)
+        # Decoder's spectrum embeddings (DECOUPLED from encoder)
+        # Spectrum tokens in decoder (8-1031) use this separate embedding space
+        # This breaks the copy pathway: encoder spectrum features -> decoder's own space
+        self.decoder_spectrum_embedding = nn.Embedding(1024, d_model)  # 1024 spectrum tokens
+
+        # Decoder output heads
+        # Shared head for special (0-7) + redshift (1032-2055) tokens (weight tied)
+        self.shared_lm_head = nn.Linear(d_model, self.REDSHIFT_END, bias=False)
+        self.shared_lm_head.weight = self.token_embedding.weight  # weight tying for shared tokens
+
+        # Separate head for decoder spectrum tokens (not tied to encoder)
+        self.spectrum_lm_head = nn.Linear(d_model, 1024, bias=False)
 
         # RoPE (shared for encoder and decoder self-attention)
         self.rope = RotaryEmbedding(d_model // n_heads, max_seq_len)
@@ -326,10 +342,77 @@ class SpectrumTransformer(nn.Module):
         ])
         self.decoder_norm = RMSNorm(d_model)
 
-        # Decoder output head (separate from encoder embedding - no weight tying)
-        self.decoder_lm_head = nn.Linear(d_model, decoder_vocab_size, bias=False)
-
         self._init_weights()
+
+    def _get_decoder_embedding(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """Map decoder token IDs to embeddings.
+
+        Special tokens (0-7) and redshift tokens (1032-2055) use shared embedding.
+        Spectrum tokens (8-1031) use decoder's own spectrum embedding, remapped to
+        decoder's local spectrum index (0-1023).
+        """
+        B, L = token_ids.shape
+        emb = torch.zeros(B, L, self.d_model, device=token_ids.device, dtype=self.token_embedding.weight.dtype)
+
+        # Special tokens (0-7) — use shared embedding
+        special_mask = token_ids < 8
+        emb[special_mask] = self.token_embedding(token_ids[special_mask])
+
+        # Redshift tokens (1032-2055) — use shared embedding
+        redshift_mask = (token_ids >= self.REDSHIFT_START) & (token_ids < self.REDSHIFT_END)
+        emb[redshift_mask] = self.token_embedding(token_ids[redshift_mask])
+
+        # Spectrum tokens (8-1031) — use decoder's own embedding, remap to [0, 1023]
+        spectrum_mask = (token_ids >= self.SPECTRUM_ENCODER_START) & (token_ids < self.SPECTRUM_ENCODER_END)
+        if spectrum_mask.any():
+            local_idx = token_ids[spectrum_mask] - self.SPECTRUM_ENCODER_START  # maps 8-1031 -> 0-1023
+            emb[spectrum_mask] = self.decoder_spectrum_embedding(local_idx)
+
+        return emb
+
+    def _get_decoder_logits(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Compute logits over decoder's vocabulary (2056 tokens).
+
+        Special (0-7) and redshift (1032-2055) logits from shared_lm_head.
+        Spectrum (8-1031) logits from spectrum_lm_head, remapped to encoder's spectrum range.
+        """
+        B, L, D = hidden.shape
+
+        # Logits for special + redshift from shared head
+        logits = torch.zeros(B, L, self.vocab_size, device=hidden.device, dtype=hidden.dtype)
+        logits[:, :, :self.REDSHIFT_END] = self.shared_lm_head(hidden)
+
+        # Logits for spectrum tokens from decoder's spectrum head, remapped to encoder range
+        spectrum_logits = self.spectrum_lm_head(hidden)  # (B, L, 1024)
+        logits[:, :, self.SPECTRUM_ENCODER_START:self.SPECTRUM_ENCODER_END] = spectrum_logits
+
+        return logits
+
+    def decode(self, decoder_input_ids: torch.Tensor, encoder_out: torch.Tensor,
+               decoder_mask: Optional[torch.Tensor] = None,
+               encoder_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Decode with cross-attention to encoder.
+
+        Args:
+            decoder_input_ids: (B, L_dec) decoder input token indices
+            encoder_out: (B, L_enc, D) encoder output
+            decoder_mask: (B, L_dec) optional padding mask
+            encoder_mask: (B, L_enc) optional encoder padding mask
+
+        Returns:
+            logits: (B, L_dec, vocab_size=2056)
+        """
+        x = self._get_decoder_embedding(decoder_input_ids)
+
+        L_dec = decoder_input_ids.shape[1]
+        cos, sin = self.rope(L_dec, x.device)
+
+        for layer in self.decoder_layers:
+            x = layer(x, encoder_out, cos, sin, decoder_mask, encoder_mask)
+
+        x = self.decoder_norm(x)
+        logits = self._get_decoder_logits(x)
+        return logits
     
     def _init_weights(self):
         for module in self.modules():
@@ -374,9 +457,9 @@ class SpectrumTransformer(nn.Module):
             encoder_mask: (B, L_enc) optional encoder padding mask
 
         Returns:
-            logits: (B, L_dec, decoder_vocab_size)
+            logits: (B, L_dec, vocab_size=2056)
         """
-        x = self.decoder_token_embedding(decoder_input_ids)
+        x = self._get_decoder_embedding(decoder_input_ids)
 
         L_dec = decoder_input_ids.shape[1]
         cos, sin = self.rope(L_dec, x.device)
@@ -385,7 +468,7 @@ class SpectrumTransformer(nn.Module):
             x = layer(x, encoder_out, cos, sin, decoder_mask, encoder_mask)
 
         x = self.decoder_norm(x)
-        logits = self.decoder_lm_head(x)
+        logits = self._get_decoder_logits(x)
         return logits
     
     def forward(
@@ -415,7 +498,7 @@ class SpectrumTransformer(nn.Module):
                 position count.
 
         Returns:
-            logits: (B, L_dec, decoder_vocab_size)
+            logits: (B, L_dec, vocab_size=2056)
             loss: scalar cross-entropy loss (if targets provided)
         """
         assert encoder_input_ids.shape[1] <= self.max_seq_len
@@ -431,7 +514,7 @@ class SpectrumTransformer(nn.Module):
         if targets is not None:
             B, L = targets.shape
             per_token = F.cross_entropy(
-                logits.view(-1, self.decoder_vocab_size),
+                logits.view(-1, self.vocab_size),
                 targets.view(-1),
                 ignore_index=-100,
                 reduction="none",
@@ -566,7 +649,7 @@ class SpectrumTransformer(nn.Module):
         targets_trunc = targets[:, 1:T+1]
 
         per_token = F.cross_entropy(
-            logits_trunc.reshape(-1, self.decoder_vocab_size),
+            logits_trunc.reshape(-1, self.vocab_size),
             targets_trunc.reshape(-1),
             ignore_index=-100,
             reduction='none',
@@ -578,7 +661,7 @@ class SpectrumTransformer(nn.Module):
         loss_spec = (per_token[:, 1:] * valid[:, 1:]).sum() / n_spec if T > 1 else torch.tensor(0.0, device=per_token.device)
         loss = redshift_weight * loss_red + loss_spec
 
-        logits_full = torch.zeros(B, targets.shape[1], self.decoder_vocab_size, device=logits_stacked.device)
+        logits_full = torch.zeros(B, targets.shape[1], self.vocab_size, device=logits_stacked.device)
         logits_full[:, :logits_stacked.shape[1], :] = logits_stacked
 
         return logits_full, loss

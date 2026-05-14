@@ -286,10 +286,9 @@ def main():
         pin_memory=device.type == "cuda",
     )
 
-    # Model — decoupled encoder/decoder vocabularies to prevent copy
+    # Model — partially decoupled vocabularies (Option 2)
     model = SpectrumTransformer(
         vocab_size=TOTAL_VOCAB_SIZE,
-        decoder_vocab_size=args.decoder_vocab_size,
         d_model=args.d_model,
         n_encoder_layers=args.n_encoder_layers,
         n_decoder_layers=args.n_decoder_layers,
