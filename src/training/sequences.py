@@ -77,7 +77,11 @@ def tokenize_and_build(
     x = torch.stack([flux, istd], dim=1)  # (B, 2, L)
 
     with torch.no_grad():
-        spec_indices, _ = spec_tok.encode(x)  # (B, n_tokens) or (B, 1, n_tokens)
+        spec_enc_out = spec_tok.encode(x)  # V1: (indices, denorm), V2: (indices, denorm, skips)
+    if isinstance(spec_enc_out, tuple):
+        spec_indices = spec_enc_out[0]  # V1: [0], V2: [0]
+    else:
+        spec_indices = spec_enc_out  # already a tensor
     if spec_indices.dim() == 3:
         spec_indices = spec_indices.squeeze(1)
     spec_tokens = spec_indices.long() + SPECTRUM_TOKEN_OFFSET  # (B, T_spec)
