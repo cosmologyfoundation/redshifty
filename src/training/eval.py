@@ -26,9 +26,13 @@ from src.models.transformer import (
 )
 from src.training.sequences import tokenize_and_build
 from src.training.utils import (
+    compute_all_auc,
+    compute_all_r2,
     compute_loss_breakdown,
+    compute_masked_auc,
     compute_masked_metrics,
     compute_masked_redshift_acc,
+    compute_masked_r2,
     compute_metrics,
 )
 
@@ -59,6 +63,13 @@ def evaluate(
     masked_n_total = 0
     rz_masked_acc_accum = 0.0
     rz_masked_n_total = 0
+    # AION benchmark metrics
+    masked_auc_accum = 0.0
+    masked_r2_accum = 0.0
+    masked_n_for_auc_r2 = 0
+    all_auc_accum = 0.0
+    all_r2_accum = 0.0
+    all_n_total = 0
     n = 0
     for i, raw in enumerate(loader):
         if raw is None:
@@ -89,6 +100,20 @@ def evaluate(
             if rm["n_rz_masked"] > 0:
                 rz_masked_acc_accum += rm["redshift_acc_masked"] * rm["n_rz_masked"]
                 rz_masked_n_total += rm["n_rz_masked"]
+        # AION benchmark: AUC and R² at masked and all positions
+        if mask_pos is not None:
+            ma = compute_masked_auc(logits, tgt, mask_pos)
+            mr = compute_masked_r2(logits, tgt, mask_pos)
+            if ma["n_masked"] > 0:
+                masked_auc_accum += ma["mean_mask_auc"] * ma["n_masked"]
+                masked_r2_accum += mr["masked_spec_r2"] * ma["n_masked"]
+                masked_n_for_auc_r2 += ma["n_masked"]
+        aa = compute_all_auc(logits, tgt)
+        ar = compute_all_r2(logits, tgt)
+        if aa["n_positions"] > 0:
+            all_auc_accum += aa["all_mean_auc"] * aa["n_positions"]
+            all_r2_accum += ar["all_spec_r2"] * aa["n_positions"]
+            all_n_total += aa["n_positions"]
         n += 1
 
     if n == 0:
@@ -98,6 +123,10 @@ def evaluate(
         if encoder_mask_ratio > 0.0:
             out["masked_spec_acc"] = nan
             out["redshift_acc_masked"] = nan
+            out["mean_mask_auc"] = nan
+            out["masked_spec_r2"] = nan
+        out["all_mean_auc"] = nan
+        out["all_spec_r2"] = nan
         return out
 
     out = {"loss": losses / n, **{k: v / n for k, v in metrics_accum.items()}}
@@ -109,6 +138,18 @@ def evaluate(
         out["redshift_acc_masked"] = (
             rz_masked_acc_accum / rz_masked_n_total if rz_masked_n_total > 0 else float("nan")
         )
+        out["mean_mask_auc"] = (
+            masked_auc_accum / masked_n_for_auc_r2 if masked_n_for_auc_r2 > 0 else float("nan")
+        )
+        out["masked_spec_r2"] = (
+            masked_r2_accum / masked_n_for_auc_r2 if masked_n_for_auc_r2 > 0 else float("nan")
+        )
+    out["all_mean_auc"] = (
+        all_auc_accum / all_n_total if all_n_total > 0 else float("nan")
+    )
+    out["all_spec_r2"] = (
+        all_r2_accum / all_n_total if all_n_total > 0 else float("nan")
+    )
     return out
 
 
@@ -136,6 +177,10 @@ def evaluate_ar(
     total_spec_correct = 0
     total_spec_positions = 0
     total_samples = 0
+    # AION benchmark: AUC and R² (no masking in AR, so masked metrics are NaN)
+    all_auc_accum = 0.0
+    all_r2_accum = 0.0
+    all_n_total = 0
 
     for i, raw in enumerate(loader):
         if raw is None:
@@ -178,10 +223,25 @@ def evaluate_ar(
             total_spec_positions += int(sp_valid.sum().item())
         total_samples += B
 
+        # AUC/R²: run forward pass with generated decoder input to get logits.
+        # This measures how well the model ranks correct tokens given what it generated.
+        with torch.amp.autocast("cuda", enabled=False):
+            logits_ar, _ = model(enc, gen_preds)  # (B, L_dec, V)
+        aa = compute_all_auc(logits_ar, tgt)
+        ar = compute_all_r2(logits_ar, tgt)
+        if aa["n_positions"] > 0:
+            all_auc_accum += aa["all_mean_auc"] * aa["n_positions"]
+            all_r2_accum += ar["all_spec_r2"] * aa["n_positions"]
+            all_n_total += aa["n_positions"]
+
     if total_samples == 0:
         return {
             "ar_redshift_acc": float("nan"),
             "ar_spectrum_acc": float("nan"),
+            "ar_mean_mask_auc": float("nan"),
+            "ar_masked_spec_r2": float("nan"),
+            "ar_all_mean_auc": float("nan"),
+            "ar_all_spec_r2": float("nan"),
             "n_samples": 0,
         }
     ar_red_acc = total_red_correct / total_samples
@@ -190,5 +250,13 @@ def evaluate_ar(
     return {
         "ar_redshift_acc": ar_red_acc,
         "ar_spectrum_acc": ar_spec_acc,
+        "ar_mean_mask_auc": float("nan"),  # AR uses no masking
+        "ar_masked_spec_r2": float("nan"),  # AR uses no masking
+        "ar_all_mean_auc": (
+            all_auc_accum / all_n_total if all_n_total > 0 else float("nan")
+        ),
+        "ar_all_spec_r2": (
+            all_r2_accum / all_n_total if all_n_total > 0 else float("nan")
+        ),
         "n_samples": total_samples,
     }

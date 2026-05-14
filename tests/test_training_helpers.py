@@ -39,6 +39,7 @@ from src.training.data_split import split_records_by_healpix
 from src.training.eval import evaluate_ar
 from src.training.sequences import tokenize_and_build
 from src.training.utils import compute_masked_metrics, compute_masked_redshift_acc
+from src.training.utils import compute_masked_auc, compute_masked_r2, compute_all_auc, compute_all_r2
 from src.training.wandb_util import init_wandb, log_model_artifact
 
 
@@ -620,3 +621,169 @@ class TestMaskedRedshiftAcc:
         out = compute_masked_redshift_acc(logits, target, rz_mask)
         assert out["n_rz_masked"] == 2
         assert out["redshift_acc_masked"] == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# AION benchmark metrics — AUC and R² (tests 18+)
+# ---------------------------------------------------------------------------
+
+class TestAUCMetrics:
+    """Tests for compute_masked_auc and compute_all_auc.
+
+    These tests validate behavior when sklearn IS available. They are
+    skipped (pass) when sklearn is absent — the code already gracefully
+    returns NaN in that case, so the important invariants (correct dict
+    keys, correct n=0 handling) are covered by the no_masked_returns_nan
+    and no_positions_returns_nan tests.
+    """
+
+    @staticmethod
+    def _sklearn_available():
+        try:
+            from sklearn.metrics import roc_auc_score
+            return True
+        except ImportError:
+            return False
+
+    def _craft(self, B=2, T=8, V=64):
+        logits = torch.zeros(B, T + 2, V)
+        target = torch.zeros(B, T + 2, dtype=torch.long)
+        target[:, 0] = 50
+        target[:, 1:1 + T] = torch.arange(T).unsqueeze(0).expand(B, -1) + 10
+        target[:, -1] = EOS_TOKEN
+        masked = torch.zeros(B, T, dtype=torch.bool)
+        return logits, target, masked
+
+    def test_masked_auc_all_correct(self):
+        if not self._sklearn_available():
+            pytest.skip("sklearn not available")
+        logits, target, mp = self._craft()
+        for b in range(target.shape[0]):
+            for t in range(target.shape[1]):
+                logits[b, t, target[b, t]] = 10.0
+        mp.fill_(True)
+        out = compute_masked_auc(logits, target, mp)
+        assert out["n_masked"] > 0
+        assert out["mean_mask_auc"] == pytest.approx(1.0, abs=0.05)
+
+    def test_masked_auc_all_wrong(self):
+        if not self._sklearn_available():
+            pytest.skip("sklearn not available")
+        logits, target, mp = self._craft(V=64)
+        mp.fill_(True)
+        for b in range(target.shape[0]):
+            for t in range(target.shape[1]):
+                correct_tok = target[b, t].item()
+                logits[b, t, correct_tok] = -100.0
+        out = compute_masked_auc(logits, target, mp)
+        assert out["n_masked"] > 0
+        assert out["mean_mask_auc"] == pytest.approx(0.0, abs=0.05)
+
+    def test_masked_auc_no_masked_returns_nan(self):
+        logits, target, mp = self._craft()
+        out = compute_masked_auc(logits, target, mp)
+        assert out["n_masked"] == 0
+        assert out["mean_mask_auc"] != out["mean_mask_auc"]
+
+    def test_all_auc_all_correct(self):
+        if not self._sklearn_available():
+            pytest.skip("sklearn not available")
+        logits, target, mp = self._craft()
+        for b in range(target.shape[0]):
+            for t in range(target.shape[1]):
+                logits[b, t, target[b, t]] = 10.0
+        out = compute_all_auc(logits, target)
+        assert out["n_positions"] > 0
+        assert out["all_mean_auc"] == pytest.approx(1.0, abs=0.05)
+
+    def test_all_auc_no_positions_returns_nan(self):
+        logits = torch.zeros(2, 10, 64)
+        target = torch.full((2, 10), -100, dtype=torch.long)
+        out = compute_all_auc(logits, target)
+        assert out["n_positions"] == 0
+        assert out["all_mean_auc"] != out["all_mean_auc"]
+
+
+class TestR2Metrics:
+    """Tests for compute_masked_r2 and compute_all_r2."""
+
+    def _craft(self, B=2, T=8, V=64):
+        logits = torch.zeros(B, T + 2, V)
+        target = torch.zeros(B, T + 2, dtype=torch.long)
+        target[:, 0] = 50
+        target[:, 1:1 + T] = torch.arange(T).unsqueeze(0).expand(B, -1) + 10
+        target[:, -1] = EOS_TOKEN
+        masked = torch.zeros(B, T, dtype=torch.bool)
+        return logits, target, masked
+
+    def test_masked_r2_perfect(self):
+        logits, target, mp = self._craft()
+        for b in range(target.shape[0]):
+            for t in range(target.shape[1]):
+                logits[b, t, target[b, t]] = 10.0
+        mp.fill_(True)
+        out = compute_masked_r2(logits, target, mp)
+        assert out["n_masked"] > 0
+        assert out["masked_spec_r2"] == pytest.approx(1.0, abs=0.01)
+
+    def test_masked_r2_random_logits(self):
+        torch.manual_seed(42)
+        logits, target, mp = self._craft()
+        logits.normal_(std=1.0)
+        mp.fill_(True)
+        out = compute_masked_r2(logits, target, mp)
+        assert out["n_masked"] > 0
+        # Random logits should give R² near 0 (within noise)
+        assert -0.2 < out["masked_spec_r2"] < 0.3
+
+    def test_masked_r2_no_masked_returns_nan(self):
+        logits, target, mp = self._craft()
+        out = compute_masked_r2(logits, target, mp)
+        assert out["n_masked"] == 0
+        assert out["masked_spec_r2"] != out["masked_spec_r2"]  # NaN
+
+    def test_all_r2_perfect(self):
+        logits, target, mp = self._craft()
+        for b in range(target.shape[0]):
+            for t in range(target.shape[1]):
+                logits[b, t, target[b, t]] = 10.0
+        out = compute_all_r2(logits, target)
+        assert out["n_positions"] > 0
+        assert out["all_spec_r2"] == pytest.approx(1.0, abs=0.01)
+
+    def test_all_r2_no_positions_returns_nan(self):
+        logits = torch.zeros(2, 10, 64)
+        target = torch.full((2, 10), -100, dtype=torch.long)
+        out = compute_all_r2(logits, target)
+        assert out["n_positions"] == 0
+        assert out["all_spec_r2"] != out["all_spec_r2"]  # NaN
+
+
+class TestEvaluateARReturnsMetrics:
+    """Test that evaluate_ar returns the new AUC/R² metrics."""
+
+    def test_returns_auc_and_r2_metrics(self):
+        spec, z = FakeSpecTok(n_tokens=4, codebook=8), FakeZTok()
+        model = SpectrumTransformer(
+            vocab_size=TOTAL_VOCAB_SIZE,
+            d_model=32, n_encoder_layers=1, n_decoder_layers=1,
+            n_heads=4, max_seq_len=64, dropout=0.0,
+        ).eval()
+
+        raw = _make_raw_batch(B=2)
+        loader = [raw]
+
+        out = evaluate_ar(
+            model, loader, spec, z, "a", torch.device("cpu"),
+            max_batches=1, encoder_mask_ratio=0.0,
+        )
+        # AR metrics (masked ones are NaN since no masking in AR)
+        assert "ar_mean_mask_auc" in out
+        assert "ar_masked_spec_r2" in out
+        # AR all-position metrics are always computed
+        assert "ar_all_mean_auc" in out
+        assert "ar_all_spec_r2" in out
+        # Original metrics still present
+        assert "ar_redshift_acc" in out
+        assert "ar_spectrum_acc" in out
+        assert out["n_samples"] == 2

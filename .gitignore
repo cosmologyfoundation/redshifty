@@ -170,3 +170,5 @@ plots/*.pdf
 # OS files
 .DS_Store
 Thumbs.db
+
+opencode.json
