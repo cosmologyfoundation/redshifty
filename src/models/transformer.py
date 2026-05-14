@@ -26,7 +26,7 @@ Special Tokens:
 Token Offsets:
   Spectrum tokens:  LFQ_index + 8        (range: 8-1031)
   Redshift tokens:  FSQ_index + 1032     (range: 1032-1287)
-  Total vocab size: 1288
+  Total vocab size: 2056
 """
 
 import math
@@ -47,7 +47,7 @@ SPEC_SEP_TOKEN = 5
 # Token offsets
 SPECTRUM_TOKEN_OFFSET = 8
 REDSHIFT_TOKEN_OFFSET = 1032
-TOTAL_VOCAB_SIZE = 1288
+TOTAL_VOCAB_SIZE = 2056
 
 
 class RMSNorm(nn.Module):
