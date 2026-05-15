@@ -64,8 +64,8 @@ def tokenize_and_build(
             token was replaced by MASK (approach A only). None if
             `encoder_mask_ratio == 0.0` or approach is "b".
     """
-    if approach not in ("a", "b"):
-        raise ValueError(f"approach must be 'a' or 'b', got {approach!r}")
+    if approach not in ("a", "b", "c"):
+        raise ValueError(f"approach must be 'a', 'b', or 'c', got {approach!r}")
     if not 0.0 <= encoder_mask_ratio <= 1.0:
         raise ValueError(f"encoder_mask_ratio must be in [0, 1], got {encoder_mask_ratio}")
 
@@ -115,14 +115,14 @@ def tokenize_and_build(
     # Stochastically mask the redshift token in the encoder (approach A only).
     rz_mask: Optional[torch.Tensor] = None
     rz_enc = rz
-    if approach == "a" and encoder_mask_ratio > 0.0:
+    if (approach == "a" or approach == "c") and encoder_mask_ratio > 0.0:
         if rng is None:
             rz_mask = torch.rand(B, 1, device=device) < encoder_mask_ratio
         else:
             rz_mask = torch.rand(B, 1, device=device, generator=rng) < encoder_mask_ratio
         rz_enc = torch.where(rz_mask, torch.full_like(rz, MASK_TOKEN), rz)
 
-    if approach == "a":
+    if approach == "a" or approach == "c":
         encoder_input = torch.cat([sos, rz_enc, spec_tokens_enc, eos], dim=1)
     else:  # 'b'
         encoder_input = torch.cat([sos, spec_tokens_enc, eos], dim=1)
