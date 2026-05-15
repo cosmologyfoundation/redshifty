@@ -441,17 +441,11 @@ class SpectrumTransformer(nn.Module):
                encoder_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Decode with OPTION A dual cross-attention paths.
 
-        Position 0 (redshift): attends to FULL encoder output via decoder_layers_full.
-        Positions 1+ (spectrum): attends to 32-token bottleneck via decoder_layers_bottleneck.
+        Position 0 (redshift): processes ONLY position 0 through full encoder path.
+        Positions 1+ (spectrum): processes positions 1+ through bottleneck path.
 
-        Args:
-            decoder_input_ids: (B, L_dec) decoder input token indices
-            encoder_out: (B, L_enc, D) encoder output
-            decoder_mask: (B, L_dec) optional padding mask
-            encoder_mask: (B, L_enc) optional encoder padding mask
-
-        Returns:
-            logits: (B, L_dec, vocab_size=2056)
+        Each position uses ONLY its designated path throughout — no cross-contamination
+        from the other path's self-attention.
         """
         x = self._get_decoder_embedding(decoder_input_ids)
 
@@ -461,18 +455,18 @@ class SpectrumTransformer(nn.Module):
         # Compress encoder to bottleneck for spectrum path
         encoder_compressed = self._compress_encoder(encoder_out)
 
-        # Process through both paths and concatenate
-        x_full = x.clone()
-        x_bottleneck = x.clone()
+        # Full path: ONLY position 0 (redshift)
+        x_full = x[:, 0:1]  # (B, 1, D) — only position 0
+        for layer_full in self.decoder_layers_full:
+            x_full = layer_full(x_full, encoder_out, encoder_compressed, cos[:1], sin[:1], None, None)
 
-        for layer_full, layer_bn in zip(self.decoder_layers_full, self.decoder_layers_bottleneck):
-            x_full = layer_full(x_full, encoder_out, encoder_compressed, cos, sin, decoder_mask, None)
-            x_bottleneck = layer_bn(x_bottleneck, encoder_out, encoder_compressed, cos, sin, decoder_mask, None)
+        # Bottleneck path: ONLY positions 1+ (spectrum)
+        x_bn = x[:, 1:]  # (B, L-1, D)
+        for layer_bn in self.decoder_layers_bottleneck:
+            x_bn = layer_bn(x_bn, encoder_out, encoder_compressed, cos[1:], sin[1:], decoder_mask, None)
 
-        # Interleave: position 0 uses full path, positions 1+ use bottleneck path
-        x = torch.zeros_like(x)
-        x[:, 0:1] = x_full[:, 0:1]
-        x[:, 1:] = x_bottleneck[:, 1:]
+        # Concatenate: position 0 from full path, positions 1+ from bottleneck path
+        x = torch.cat([x_full, x_bn], dim=1)  # (B, L, D)
 
         x = self.decoder_norm(x)
         logits = self._get_decoder_logits(x)
