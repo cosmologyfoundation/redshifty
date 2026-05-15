@@ -47,6 +47,7 @@ def evaluate(
     device: torch.device,
     amp: bool,
     redshift_weight: float,
+    aux_redshift_weight: float = 1.0,
     encoder_mask_ratio: float = 0.0,
     max_batches: int = 50,
 ) -> Dict[str, float]:
@@ -81,7 +82,8 @@ def evaluate(
             encoder_mask_ratio=encoder_mask_ratio,
         )
         with torch.amp.autocast("cuda", enabled=amp):
-            logits, loss = model(enc, dec, targets=tgt, redshift_weight=redshift_weight)
+            logits, loss = model(enc, dec, targets=tgt, redshift_weight=redshift_weight,
+                                  aux_redshift_weight=aux_redshift_weight)
         losses += float(loss.item())
         m = compute_metrics(logits, tgt)
         for k in metrics_accum:

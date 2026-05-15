@@ -274,7 +274,7 @@ class DecoderBlock(nn.Module):
 class SpectrumTransformer(nn.Module):
     """Encoder-decoder transformer for spectrum + redshift token modeling.
 
-    Architecture: PARTIALLY decoupled vocabularies + CROSS-ATTENTION BOTTLENECK.
+    Architecture: Option C — SINGLE bottleneck cross-attention path + AUXILIARY REDSHIFT HEAD.
 
     Key copy-prevention mechanisms:
     1. Partially decoupled vocab: spectrum tokens use separate embedding space
@@ -282,6 +282,11 @@ class SpectrumTransformer(nn.Module):
        learned attention pooling before cross-attention. This removes fine-grained
        positional identity — decoder cannot look up specific encoder positions.
     3. Encoder masking (50%+) further forces the encoder to build robust features
+
+    Option C specifics:
+    - Single decoder path with bottleneck cross-attention (spectrum copy prevented)
+    - Auxiliary redshift head: MLP(encoder_output.mean(dim=1)) → z classification
+      This provides a DIRECT gradient path for redshift, bypassing the bottleneck.
 
     - Special (0-7) and redshift (1032-2055): SHARED embedding between enc/dec
     - Spectrum (8-1031): DECOUPLED — decoder has own embedding space
@@ -296,6 +301,7 @@ class SpectrumTransformer(nn.Module):
         max_seq_len: Maximum sequence length (default 512)
         dropout: Dropout rate (default 0.1)
         n_bottleneck_tokens: Number of tokens to compress encoder to (default 32)
+        n_redshift_classes: Number of redshift classification classes (default 256)
     """
 
     SPECTRUM_ENCODER_START = 8
@@ -313,6 +319,7 @@ class SpectrumTransformer(nn.Module):
         max_seq_len: int = 512,
         dropout: float = 0.1,
         n_bottleneck_tokens: int = 32,
+        n_redshift_classes: int = 256,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -322,6 +329,7 @@ class SpectrumTransformer(nn.Module):
         self.n_heads = n_heads
         self.max_seq_len = max_seq_len
         self.n_bottleneck_tokens = n_bottleneck_tokens
+        self.n_redshift_classes = n_redshift_classes
 
         # Encoder token embeddings (shared with frozen tokenizer)
         self.token_embedding = nn.Embedding(vocab_size, d_model)
@@ -354,18 +362,23 @@ class SpectrumTransformer(nn.Module):
         ])
         self.encoder_norm = RMSNorm(d_model)
 
-        # Decoder: TWO paths for Option A dual cross-attention
-        # - decoder_layers_full: for position 0 (redshift) — attends to FULL encoder
-        # - decoder_layers_bottleneck: for positions 1+ (spectrum) — attends to 32 tokens
-        self.decoder_layers_full = nn.ModuleList([
-            DecoderBlock(d_model, n_heads, dropout, use_bottleneck=False)
-            for _ in range(n_decoder_layers)
-        ])
-        self.decoder_layers_bottleneck = nn.ModuleList([
+        # Decoder: single bottleneck path (same as original working architecture)
+        self.decoder_layers = nn.ModuleList([
             DecoderBlock(d_model, n_heads, dropout, use_bottleneck=True)
             for _ in range(n_decoder_layers)
         ])
         self.decoder_norm = RMSNorm(d_model)
+
+        # ===== OPTION C: Auxiliary Redshift Head =====
+        # Direct MLP path for redshift prediction from pooled encoder output.
+        # This bypasses the bottleneck cross-attention and provides strong gradient
+        # signal for redshift learning without affecting the spectrum path.
+        self.redshift_aux_head = nn.Sequential(
+            nn.Linear(d_model, d_model, bias=False),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+            nn.Linear(d_model, n_redshift_classes),
+        )
 
         self._init_weights()
 
@@ -439,34 +452,23 @@ class SpectrumTransformer(nn.Module):
     def decode(self, decoder_input_ids: torch.Tensor, encoder_out: torch.Tensor,
                decoder_mask: Optional[torch.Tensor] = None,
                encoder_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Decode with OPTION A dual cross-attention paths.
+        """Decode with single bottleneck cross-attention path.
 
-        Position 0 (redshift): processes ONLY position 0 through full encoder path.
-        Positions 1+ (spectrum): processes positions 1+ through bottleneck path.
-
-        Each position uses ONLY its designated path throughout — no cross-contamination
-        from the other path's self-attention.
+        All decoder positions attend to the 32-token compressed encoder output.
+        The auxiliary redshift head (in forward()) provides direct redshift prediction
+        from pooled encoder output, independent of this path.
         """
         x = self._get_decoder_embedding(decoder_input_ids)
 
         L_dec = decoder_input_ids.shape[1]
         cos, sin = self.rope(L_dec, x.device)
 
-        # Compress encoder to bottleneck for spectrum path
+        # Compress encoder to bottleneck
         encoder_compressed = self._compress_encoder(encoder_out)
 
-        # Full path: ONLY position 0 (redshift)
-        x_full = x[:, 0:1]  # (B, 1, D) — only position 0
-        for layer_full in self.decoder_layers_full:
-            x_full = layer_full(x_full, encoder_out, encoder_compressed, cos[:1], sin[:1], None, None)
-
-        # Bottleneck path: ONLY positions 1+ (spectrum)
-        x_bn = x[:, 1:]  # (B, L-1, D)
-        for layer_bn in self.decoder_layers_bottleneck:
-            x_bn = layer_bn(x_bn, encoder_out, encoder_compressed, cos[1:], sin[1:], decoder_mask, None)
-
-        # Concatenate: position 0 from full path, positions 1+ from bottleneck path
-        x = torch.cat([x_full, x_bn], dim=1)  # (B, L, D)
+        # Single decoder path with bottleneck cross-attention
+        for layer in self.decoder_layers:
+            x = layer(x, encoder_out, encoder_compressed, cos, sin, decoder_mask, None)
 
         x = self.decoder_norm(x)
         logits = self._get_decoder_logits(x)
@@ -511,8 +513,9 @@ class SpectrumTransformer(nn.Module):
         decoder_mask: Optional[torch.Tensor] = None,
         targets: Optional[torch.Tensor] = None,
         redshift_weight: float = 1.0,
+        aux_redshift_weight: float = 1.0,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Full forward pass.
+        """Full forward pass with Option C auxiliary redshift head.
 
         Args:
             encoder_input_ids: (B, L_enc) encoder input
@@ -522,16 +525,15 @@ class SpectrumTransformer(nn.Module):
             targets: (B, L_dec) target tokens for loss
             redshift_weight: scalar multiplier on the position-0 (redshift)
                 cross-entropy term relative to the position-1+ (spectrum)
-                term. The two terms are first reduced to per-token means,
-                then combined as `redshift_weight * loss_redshift + loss_spectrum`.
-                Default 1.0 keeps the two contributions on equal per-token
-                footing. Set higher (e.g. 50) to force the model to learn
-                the redshift token despite spectrum tokens dominating the
-                position count.
+                term.
+            aux_redshift_weight: scalar multiplier on the auxiliary redshift
+                head loss. This loss is computed from pooled encoder output
+                and provides direct gradient signal for redshift learning,
+                bypassing the cross-attention bottleneck.
 
         Returns:
             logits: (B, L_dec, vocab_size=2056)
-            loss: scalar cross-entropy loss (if targets provided)
+            loss: scalar combined loss (if targets provided)
         """
         assert encoder_input_ids.shape[1] <= self.max_seq_len
         assert decoder_input_ids.shape[1] <= self.max_seq_len
@@ -539,12 +541,14 @@ class SpectrumTransformer(nn.Module):
         # Encode
         encoder_out = self.encode(encoder_input_ids, encoder_mask)
 
-        # Decode
+        # Decode (single bottleneck path)
         logits = self.decode(decoder_input_ids, encoder_out, decoder_mask, encoder_mask)
 
         loss = None
         if targets is not None:
             B, L = targets.shape
+
+            # === Main sequence cross-entropy loss ===
             per_token = F.cross_entropy(
                 logits.view(-1, self.vocab_size),
                 targets.view(-1),
@@ -557,9 +561,33 @@ class SpectrumTransformer(nn.Module):
                 n_spec = valid[:, 1:].sum().clamp(min=1.0)
                 loss_red = (per_token[:, 0] * valid[:, 0]).sum() / n_red
                 loss_spec = (per_token[:, 1:] * valid[:, 1:]).sum() / n_spec
-                loss = redshift_weight * loss_red + loss_spec
+                loss_seq = redshift_weight * loss_red + loss_spec
             else:
-                loss = (per_token[:, 0] * valid[:, 0]).sum() / n_red
+                loss_seq = (per_token[:, 0] * valid[:, 0]).sum() / n_red
+
+            # === OPTION C: Auxiliary redshift head loss ===
+            # Pool encoder output → MLP → redshift class
+            # Target: extract fsq_index from position 0 of targets
+            encoder_pooled = encoder_out.mean(dim=1)  # (B, d_model)
+            rz_logits = self.redshift_aux_head(encoder_pooled)  # (B, n_redshift_classes)
+
+            # Extract fsq index from target redshift token (position 0)
+            # Redshift token = REDSHIFT_TOKEN_OFFSET + fsq_index
+            # fsq_index = target_token_id - REDSHIFT_TOKEN_OFFSET
+            rz_target = targets[:, 0].clone()
+            rz_target_mask = (rz_target != -100) & (rz_target >= self.REDSHIFT_START) & (rz_target < self.REDSHIFT_END)
+            rz_class = torch.where(
+                rz_target_mask,
+                rz_target - self.REDSHIFT_START,  # maps to [0, n_redshift_classes)
+                torch.zeros_like(rz_target),
+            )
+            # Clamp to valid range
+            rz_class = rz_class.clamp(0, self.n_redshift_classes - 1)
+
+            loss_aux = F.cross_entropy(rz_logits, rz_class, reduction="mean")
+
+            # Combined loss
+            loss = loss_seq + aux_redshift_weight * loss_aux
 
         return logits, loss
     
@@ -637,6 +665,7 @@ class SpectrumTransformer(nn.Module):
         targets: torch.Tensor,
         max_generate_tokens: int = 50,
         redshift_weight: float = 1.0,
+        aux_redshift_weight: float = 0.0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute autoregressive loss (full AR, no teacher forcing).
 
@@ -651,10 +680,11 @@ class SpectrumTransformer(nn.Module):
             targets: (B, L_dec) target tokens [redshift, s1, s2, ..., sN, EOS]
             max_generate_tokens: truncate generation at this many tokens (for speed)
             redshift_weight: weight on position-0 (redshift) loss
+            aux_redshift_weight: weight on auxiliary redshift head loss
 
         Returns:
             logits: (B, L, decoder_vocab_size) full logits sequence for logging/metrics
-            loss: scalar loss (AR loss only)
+            loss: scalar loss (AR loss + aux redshift if aux_redshift_weight > 0)
         """
         B = encoder_input_ids.shape[0]
 
@@ -692,6 +722,21 @@ class SpectrumTransformer(nn.Module):
         loss_red = (per_token[:, 0] * valid[:, 0]).sum() / n_red
         loss_spec = (per_token[:, 1:] * valid[:, 1:]).sum() / n_spec if T > 1 else torch.tensor(0.0, device=per_token.device)
         loss = redshift_weight * loss_red + loss_spec
+
+        # === OPTION C: Auxiliary redshift head loss ===
+        if aux_redshift_weight > 0:
+            encoder_pooled = encoder_out.mean(dim=1)  # (B, d_model)
+            rz_logits = self.redshift_aux_head(encoder_pooled)  # (B, n_redshift_classes)
+            rz_target = targets[:, 0].clone()
+            rz_target_mask = (rz_target != -100) & (rz_target >= self.REDSHIFT_START) & (rz_target < self.REDSHIFT_END)
+            rz_class = torch.where(
+                rz_target_mask,
+                rz_target - self.REDSHIFT_START,
+                torch.zeros_like(rz_target),
+            )
+            rz_class = rz_class.clamp(0, self.n_redshift_classes - 1)
+            loss_aux = F.cross_entropy(rz_logits, rz_class, reduction="mean")
+            loss = loss + aux_redshift_weight * loss_aux
 
         logits_full = torch.zeros(B, targets.shape[1], self.vocab_size, device=logits_stacked.device)
         logits_full[:, :logits_stacked.shape[1], :] = logits_stacked

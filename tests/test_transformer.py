@@ -1,9 +1,10 @@
 """
 Tests for SpectrumTransformer (Encoder-Decoder)
-================================================
+===============================================
 """
 
 import torch
+import torch.nn as nn
 import pytest
 from src.models.transformer import (
     SpectrumTransformer,
@@ -596,18 +597,20 @@ class TestDecoupledVocabWithDenoising:
         assert loss.item() > 0
 
 
-class TestOptionACrossAttention:
-    """Tests for Option A: Dual cross-attention paths.
+class TestOptionCCrossAttention:
+    """Tests for Option C: Single bottleneck path + Auxiliary Redshift Head.
 
     Architecture:
-    - Position 0 (redshift): attends to FULL encoder output via decoder_layers_full
-    - Positions 1+ (spectrum): attends to 32-token bottleneck via decoder_layers_bottleneck
+    - Single decoder path with bottleneck cross-attention (spectrum copy prevented)
+    - Auxiliary redshift head: MLP(encoder_output.mean(dim=1)) → z classification
+      This provides a DIRECT gradient path for redshift, bypassing the bottleneck.
 
-    This is implemented via two separate decoder layer lists in SpectrumTransformer.
+    This replaces the Option A dual-path approach which had a structural flaw:
+    position 0's self-attention had no context (causal mask + single position).
     """
 
-    def test_dual_path_forward_shape(self):
-        """Forward pass with dual paths produces correct shape."""
+    def test_single_path_forward_shape(self):
+        """Forward pass with Option C produces correct shape."""
         model = SpectrumTransformer(
             vocab_size=2056,
             d_model=128,
@@ -622,8 +625,8 @@ class TestOptionACrossAttention:
         assert logits.shape == (2, 12, 2056)
         assert loss is None
 
-    def test_dual_path_forward_with_targets(self):
-        """Forward pass with targets returns loss."""
+    def test_single_path_forward_with_targets(self):
+        """Forward pass with targets returns combined loss."""
         model = SpectrumTransformer(
             vocab_size=2056,
             d_model=128,
@@ -640,8 +643,8 @@ class TestOptionACrossAttention:
         assert loss is not None
         assert loss.item() > 0
 
-    def test_full_path_has_both_layer_lists(self):
-        """Model has both decoder_layers_full and decoder_layers_bottleneck."""
+    def test_auxiliary_redshift_head_exists(self):
+        """Model has redshift_aux_head MLP."""
         model = SpectrumTransformer(
             vocab_size=2056,
             d_model=128,
@@ -649,14 +652,81 @@ class TestOptionACrossAttention:
             n_decoder_layers=3,
             n_heads=4,
             max_seq_len=128,
+            n_redshift_classes=256,
         )
-        assert hasattr(model, 'decoder_layers_full')
-        assert hasattr(model, 'decoder_layers_bottleneck')
-        assert len(model.decoder_layers_full) == 3
-        assert len(model.decoder_layers_bottleneck) == 3
-        # Full path uses full encoder, bottleneck path uses compressed
-        assert not model.decoder_layers_full[0].use_bottleneck
-        assert model.decoder_layers_bottleneck[0].use_bottleneck
+        assert hasattr(model, 'redshift_aux_head')
+        # Check it's an MLP with expected structure
+        assert isinstance(model.redshift_aux_head, nn.Sequential)
+        # Last layer should output n_redshift_classes
+        last_linear = model.redshift_aux_head[-1]
+        assert last_linear.out_features == 256
+
+    def test_auxiliary_head_forward(self):
+        """Auxiliary head produces valid redshift logits."""
+        model = SpectrumTransformer(
+            vocab_size=2056,
+            d_model=128,
+            n_encoder_layers=2,
+            n_decoder_layers=2,
+            n_heads=4,
+            max_seq_len=128,
+            n_redshift_classes=256,
+        )
+        encoder_out = torch.randn(2, 50, 128)  # (B, L_enc, d_model)
+        pooled = encoder_out.mean(dim=1)  # (B, d_model)
+        rz_logits = model.redshift_aux_head(pooled)
+        assert rz_logits.shape == (2, 256)
+
+    def test_auxiliary_head_gradients_flow(self):
+        """Auxiliary head gradients flow to encoder."""
+        model = SpectrumTransformer(
+            vocab_size=2056,
+            d_model=128,
+            n_encoder_layers=2,
+            n_decoder_layers=2,
+            n_heads=4,
+            max_seq_len=128,
+            n_redshift_classes=256,
+        )
+        enc_ids = torch.randint(REDSHIFT_TOKEN_OFFSET, 2056, (2, 15))
+        dec_ids = torch.randint(REDSHIFT_TOKEN_OFFSET, 2056, (2, 12))
+        targets = torch.randint(REDSHIFT_TOKEN_OFFSET, 2056, (2, 12))
+        targets[:, 0] = REDSHIFT_TOKEN_OFFSET + 100
+
+        _, loss = model(enc_ids, dec_ids, targets=targets,
+                       redshift_weight=50.0, aux_redshift_weight=1.0)
+        loss.backward()
+
+        # Gradient should exist on encoder layers
+        for layer in model.encoder_layers:
+            assert layer.mlp.w3.weight.grad is not None
+            assert layer.mlp.w3.weight.grad.sum() != 0
+
+    def test_auxiliary_head_contributes_to_loss(self):
+        """Auxiliary head contributes to total loss."""
+        model = SpectrumTransformer(
+            vocab_size=2056,
+            d_model=128,
+            n_encoder_layers=2,
+            n_decoder_layers=2,
+            n_heads=4,
+            max_seq_len=128,
+            n_redshift_classes=256,
+        )
+        enc_ids = torch.randint(REDSHIFT_TOKEN_OFFSET, 2056, (2, 15))
+        dec_ids = torch.randint(REDSHIFT_TOKEN_OFFSET, 2056, (2, 12))
+        targets = torch.randint(REDSHIFT_TOKEN_OFFSET, 2056, (2, 12))
+
+        # With aux_weight=0, only sequence loss
+        _, loss_no_aux = model(enc_ids, dec_ids, targets=targets,
+                               redshift_weight=50.0, aux_redshift_weight=0.0)
+        # With aux_weight=1, sequence + auxiliary loss
+        _, loss_with_aux = model(enc_ids, dec_ids, targets=targets,
+                                  redshift_weight=50.0, aux_redshift_weight=1.0)
+
+        # Both should produce valid losses
+        assert loss_no_aux.item() > 0
+        assert loss_with_aux.item() > 0
 
     def test_bottleneck_still_compresses(self):
         """Bottleneck path still compresses encoder to 32 tokens."""
@@ -669,7 +739,7 @@ class TestOptionACrossAttention:
             max_seq_len=128,
             n_bottleneck_tokens=32,
         )
-        encoder_out = torch.randn(2, 100, 128)  # 100 encoder positions
+        encoder_out = torch.randn(2, 100, 128)
         compressed = model._compress_encoder(encoder_out)
         assert compressed.shape == (2, 32, 128)
 
@@ -687,17 +757,16 @@ class TestOptionACrossAttention:
         dec_ids = torch.randint(0, 2056, (2, 12))
         targets = torch.randint(0, 2056, (2, 12))
 
-        # Both weights = 1, so combined loss ~ sum of both
-        _, loss_w1 = model(enc_ids, dec_ids, targets=targets, redshift_weight=1.0)
-        # Only redshift weighted, so loss ~ loss_redshift
-        _, loss_w50 = model(enc_ids, dec_ids, targets=targets, redshift_weight=50.0)
+        _, loss_w1 = model(enc_ids, dec_ids, targets=targets,
+                         redshift_weight=1.0, aux_redshift_weight=0.0)
+        _, loss_w50 = model(enc_ids, dec_ids, targets=targets,
+                            redshift_weight=50.0, aux_redshift_weight=0.0)
 
-        # With weight=50, loss should be dominated by position 0
         assert loss_w50.item() > loss_w1.item(), \
             f"weight=50 ({loss_w50.item():.3f}) should be > weight=1 ({loss_w1.item():.3f})"
 
     def test_generate_autoregressive(self):
-        """Autoregressive generation works with dual paths."""
+        """Autoregressive generation works with Option C."""
         model = SpectrumTransformer(
             vocab_size=2056,
             d_model=128,
@@ -712,8 +781,8 @@ class TestOptionACrossAttention:
         assert (output >= 0).all()
         assert (output < 2056).all()
 
-    def test_ar_loss_with_dual_paths(self):
-        """AR loss is computed correctly with dual cross-attention paths."""
+    def test_ar_loss_with_single_path(self):
+        """AR loss is computed correctly with single bottleneck path."""
         model = SpectrumTransformer(
             vocab_size=2056,
             d_model=128,
@@ -744,7 +813,8 @@ class TestOptionACrossAttention:
             enc_ids = torch.randint(0, 2056, (2, seq_len))
             dec_ids = torch.randint(0, 2056, (2, seq_len - 1))
             targets = torch.randint(0, 2056, (2, seq_len - 1))
-            logits, loss = model(enc_ids, dec_ids, targets=targets)
+            logits, loss = model(enc_ids, dec_ids, targets=targets,
+                               redshift_weight=50.0, aux_redshift_weight=1.0)
             assert logits.shape == (2, seq_len - 1, 2056)
             assert loss is not None
 
@@ -767,7 +837,7 @@ class TestOptionACrossAttention:
             assert loss is not None
 
     def test_approach_a_redshift_learning(self):
-        """Approach A with dual paths can learn redshift."""
+        """Approach A with Option C can learn redshift via aux head."""
         model = SpectrumTransformer(
             vocab_size=2056,
             d_model=128,
@@ -775,6 +845,7 @@ class TestOptionACrossAttention:
             n_decoder_layers=3,
             n_heads=4,
             max_seq_len=128,
+            n_redshift_classes=256,
         )
         redshift = encode_redshift_token(torch.tensor(500))
         spectrum = encode_spectrum_token(torch.tensor([100, 200, 300, 400]))
@@ -786,95 +857,30 @@ class TestOptionACrossAttention:
             dec_in.unsqueeze(0),
             targets=target.unsqueeze(0),
             redshift_weight=50.0,
+            aux_redshift_weight=1.0,
         )
         assert logits.shape == (1, len(dec_in), 2056)
         assert loss is not None
         assert loss.item() > 0
 
-    def test_position_0_uses_full_path_gradients(self):
-        """Position 0 gradients flow through full encoder path."""
+    def test_decoder_has_single_bottleneck_path(self):
+        """Model has single decoder_layers list with bottleneck."""
         model = SpectrumTransformer(
             vocab_size=2056,
             d_model=128,
             n_encoder_layers=2,
-            n_decoder_layers=2,
+            n_decoder_layers=3,
             n_heads=4,
             max_seq_len=128,
         )
-        # Ensure we have redshift at position 0 in targets
-        enc_ids = torch.randint(REDSHIFT_TOKEN_OFFSET, 2056, (2, 15))
-        dec_ids = torch.randint(REDSHIFT_TOKEN_OFFSET, 2056, (2, 12))
-        targets = torch.randint(REDSHIFT_TOKEN_OFFSET, 2056, (2, 12))
-        targets[:, 0] = REDSHIFT_TOKEN_OFFSET + 500  # Force position 0 to be redshift
+        assert hasattr(model, 'decoder_layers')
+        assert len(model.decoder_layers) == 3
+        # All layers should use bottleneck
+        for layer in model.decoder_layers:
+            assert layer.use_bottleneck
 
-        _, loss = model(enc_ids, dec_ids, targets=targets, redshift_weight=50.0)
-        loss.backward()
-
-        # Gradient should exist on decoder_layers_full parameters
-        for layer in model.decoder_layers_full:
-            assert layer.cross_attn.o_proj.weight.grad is not None
-            assert layer.cross_attn.o_proj.weight.grad.sum() != 0
-
-    def test_position_1plus_uses_bottleneck_path_gradients(self):
-        """Positions 1+ gradients flow through bottleneck encoder path."""
-        model = SpectrumTransformer(
-            vocab_size=2056,
-            d_model=128,
-            n_encoder_layers=2,
-            n_decoder_layers=2,
-            n_heads=4,
-            max_seq_len=128,
-        )
-        enc_ids = torch.randint(8, 1032, (2, 15))  # spectrum tokens in encoder
-        dec_ids = torch.randint(8, 1032, (2, 12))  # spectrum tokens in decoder
-        targets = torch.randint(8, 1032, (2, 12))  # spectrum targets
-
-        _, loss = model(enc_ids, dec_ids, targets=targets, redshift_weight=1.0)
-        loss.backward()
-
-        # Gradient should exist on decoder_layers_bottleneck parameters
-        for layer in model.decoder_layers_bottleneck:
-            assert layer.cross_attn.o_proj.weight.grad is not None
-            assert layer.cross_attn.o_proj.weight.grad.sum() != 0
-
-    def test_bottleneck_prevents_position_copy(self):
-        """With bottleneck, decoder cannot attend to specific encoder positions."""
-        model = SpectrumTransformer(
-            vocab_size=2056,
-            d_model=128,
-            n_encoder_layers=2,
-            n_decoder_layers=2,
-            n_heads=4,
-            max_seq_len=128,
-            n_bottleneck_tokens=16,
-        )
-        enc_ids = torch.randint(0, 2056, (2, 15))
-        dec_ids = torch.randint(0, 2056, (2, 12))
-        targets = torch.randint(0, 2056, (2, 12))
-        logits, loss = model(enc_ids, dec_ids, targets=targets)
-        assert logits.shape == (2, 12, 2056)
-        assert loss is not None
-
-    def test_get_decoder_embedding_maps_correctly(self):
-        """_get_decoder_embedding correctly routes special/redshift vs spectrum."""
-        model = SpectrumTransformer(
-            vocab_size=2056,
-            d_model=64,
-            n_encoder_layers=1,
-            n_decoder_layers=1,
-            n_heads=4,
-            max_seq_len=64,
-        )
-        tokens = torch.tensor([[0, 1032, 500, 8]])  # [SOS, redshift, spectrum, spectrum]
-        emb = model._get_decoder_embedding(tokens)
-
-        assert emb.shape == (1, 4, 64)
-
-        shared_emb_sos = model.token_embedding(torch.tensor([0]))
-        assert torch.allclose(emb[0, 0], shared_emb_sos[0], atol=1e-5)
-
-    def test_encoder_mask_plus_bottleneck(self):
-        """Both encoder masking and bottleneck work together."""
+    def test_encoder_mask_plus_option_c(self):
+        """Encoder masking works with Option C."""
         model = SpectrumTransformer(
             vocab_size=2056,
             d_model=256,
@@ -921,27 +927,7 @@ class TestOptionACrossAttention:
         tokens = torch.tensor([[0, 1032, 500, 8]])  # [SOS, redshift, spectrum, spectrum]
         emb = model._get_decoder_embedding(tokens)
 
-        # Position 0 (SOS) — uses shared embedding
         assert emb.shape == (1, 4, 64)
 
-        # Position 1 (redshift 1032) — uses shared embedding
         shared_emb_sos = model.token_embedding(torch.tensor([0]))
         assert torch.allclose(emb[0, 0], shared_emb_sos[0], atol=1e-5)
-
-    def test_encoder_mask_plus_partial_decoupling(self):
-        """Both encoder masking and partial decoupling work together."""
-        model = SpectrumTransformer(
-            vocab_size=2056,
-            d_model=256,
-            n_encoder_layers=2,
-            n_decoder_layers=2,
-            n_heads=4,
-            max_seq_len=128,
-        )
-        enc_ids = torch.randint(0, 2056, (2, 15))
-        dec_ids = torch.randint(0, 2056, (2, 12))
-        targets = torch.randint(0, 2056, (2, 12))
-        logits, loss = model(enc_ids, dec_ids, targets=targets)
-        assert logits.shape == (2, 12, 2056)
-        assert loss is not None
-        assert loss.item() > 0

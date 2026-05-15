@@ -124,6 +124,8 @@ def parse_args():
     p.add_argument("--amp", action="store_true")
     p.add_argument("--redshift-loss-weight", type=float, default=50.0,
                    help="Multiplier on position-0 (redshift) loss term.")
+    p.add_argument("--aux-redshift-weight", type=float, default=1.0,
+                   help="Multiplier on the auxiliary redshift head loss (Option C).")
     p.add_argument("--encoder-mask-ratio", type=float, default=0.50,
                    help="Fraction of encoder spectrum positions to replace "
                         "with [MASK]. BERT-style. 0.0 disables; 0.50 recommended "
@@ -380,10 +382,12 @@ def main():
                     enc, tgt,
                     max_generate_tokens=args.ar_max_tokens,
                     redshift_weight=args.redshift_loss_weight,
+                    aux_redshift_weight=args.aux_redshift_weight,
                 )
             else:
                 logits, loss = model(enc, dec_for_loss, targets=tgt_for_loss,
-                                     redshift_weight=args.redshift_loss_weight)
+                                     redshift_weight=args.redshift_loss_weight,
+                                     aux_redshift_weight=args.aux_redshift_weight)
         scaler.scale(loss).backward()
         if args.grad_clip > 0:
             scaler.unscale_(optim)
@@ -460,6 +464,7 @@ def main():
                 model.module if is_distributed else model,
                 val_loader, spec_tok, z_tok, args.approach, device,
                 args.amp, args.redshift_loss_weight,
+                args.aux_redshift_weight,
                 encoder_mask_ratio=args.encoder_mask_ratio,
             )
             model.train()
