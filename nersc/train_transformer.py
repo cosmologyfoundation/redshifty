@@ -95,7 +95,7 @@ def parse_args():
                    help="How many redrock files to scan when fitting RedshiftTokenizer")
 
     # Approach
-    p.add_argument("--approach", choices=["a", "b"], required=True)
+    p.add_argument("--approach", choices=["a", "b", "c"], required=True)
 
     # Model
     p.add_argument("--d-model", type=int, default=768)
