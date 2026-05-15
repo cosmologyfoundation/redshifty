@@ -235,9 +235,18 @@ class EncoderBlock(nn.Module):
 
 
 class DecoderBlock(nn.Module):
-    """Decoder block: causal self-attention + cross-attention + MLP."""
-    
-    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0):
+    """Decoder block: causal self-attention + cross-attention + MLP.
+
+    Args:
+        d_model: Model dimension
+        n_heads: Number of attention heads
+        dropout: Dropout rate
+        use_bottleneck: If True, cross-attention uses bottleneck (32 tokens).
+            If False, cross-attention uses full encoder output.
+    """
+
+    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0,
+                 use_bottleneck: bool = True):
         super().__init__()
         self.norm1 = RMSNorm(d_model)
         self.self_attn = MultiHeadAttention(d_model, n_heads, dropout, causal=True, use_rope=True)
@@ -245,15 +254,18 @@ class DecoderBlock(nn.Module):
         self.cross_attn = MultiHeadAttention(d_model, n_heads, dropout, causal=False, use_rope=False)
         self.norm3 = RMSNorm(d_model)
         self.mlp = SwiGLU(d_model, dropout=dropout)
-    
-    def forward(self, x: torch.Tensor, encoder_out: torch.Tensor,
+        self.use_bottleneck = use_bottleneck
+
+    def forward(self, x: torch.Tensor, encoder_full: torch.Tensor,
+                encoder_compressed: torch.Tensor,
                 self_cos: torch.Tensor, self_sin: torch.Tensor,
                 self_mask: Optional[torch.Tensor] = None,
                 cross_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         # Causal self-attention
         x = x + self.self_attn(self.norm1(x), cos=self_cos, sin=self_sin, mask=self_mask)
-        # Cross-attention to encoder
-        x = x + self.cross_attn(self.norm2(x), context=encoder_out, mask=cross_mask)
+        # Cross-attention: use bottleneck if use_bottleneck=True, else full encoder
+        enc_ctx = encoder_compressed if self.use_bottleneck else encoder_full
+        x = x + self.cross_attn(self.norm2(x), context=enc_ctx, mask=cross_mask)
         # MLP
         x = x + self.mlp(self.norm3(x))
         return x
@@ -342,9 +354,15 @@ class SpectrumTransformer(nn.Module):
         ])
         self.encoder_norm = RMSNorm(d_model)
 
-        # Decoder
-        self.decoder_layers = nn.ModuleList([
-            DecoderBlock(d_model, n_heads, dropout)
+        # Decoder: TWO paths for Option A dual cross-attention
+        # - decoder_layers_full: for position 0 (redshift) — attends to FULL encoder
+        # - decoder_layers_bottleneck: for positions 1+ (spectrum) — attends to 32 tokens
+        self.decoder_layers_full = nn.ModuleList([
+            DecoderBlock(d_model, n_heads, dropout, use_bottleneck=False)
+            for _ in range(n_decoder_layers)
+        ])
+        self.decoder_layers_bottleneck = nn.ModuleList([
+            DecoderBlock(d_model, n_heads, dropout, use_bottleneck=True)
             for _ in range(n_decoder_layers)
         ])
         self.decoder_norm = RMSNorm(d_model)
@@ -421,7 +439,10 @@ class SpectrumTransformer(nn.Module):
     def decode(self, decoder_input_ids: torch.Tensor, encoder_out: torch.Tensor,
                decoder_mask: Optional[torch.Tensor] = None,
                encoder_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Decode with cross-attention to encoder.
+        """Decode with OPTION A dual cross-attention paths.
+
+        Position 0 (redshift): attends to FULL encoder output via decoder_layers_full.
+        Positions 1+ (spectrum): attends to 32-token bottleneck via decoder_layers_bottleneck.
 
         Args:
             decoder_input_ids: (B, L_dec) decoder input token indices
@@ -437,8 +458,21 @@ class SpectrumTransformer(nn.Module):
         L_dec = decoder_input_ids.shape[1]
         cos, sin = self.rope(L_dec, x.device)
 
-        for layer in self.decoder_layers:
-            x = layer(x, encoder_out, cos, sin, decoder_mask, encoder_mask)
+        # Compress encoder to bottleneck for spectrum path
+        encoder_compressed = self._compress_encoder(encoder_out)
+
+        # Process through both paths and concatenate
+        x_full = x.clone()
+        x_bottleneck = x.clone()
+
+        for layer_full, layer_bn in zip(self.decoder_layers_full, self.decoder_layers_bottleneck):
+            x_full = layer_full(x_full, encoder_out, encoder_compressed, cos, sin, decoder_mask, None)
+            x_bottleneck = layer_bn(x_bottleneck, encoder_out, encoder_compressed, cos, sin, decoder_mask, None)
+
+        # Interleave: position 0 uses full path, positions 1+ use bottleneck path
+        x = torch.zeros_like(x)
+        x[:, 0:1] = x_full[:, 0:1]
+        x[:, 1:] = x_bottleneck[:, 1:]
 
         x = self.decoder_norm(x)
         logits = self._get_decoder_logits(x)
@@ -474,35 +508,6 @@ class SpectrumTransformer(nn.Module):
         
         x = self.encoder_norm(x)
         return x
-    
-    def decode(self, decoder_input_ids: torch.Tensor, encoder_out: torch.Tensor,
-               decoder_mask: Optional[torch.Tensor] = None,
-               encoder_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Decode with cross-attention to encoder.
-
-        Args:
-            decoder_input_ids: (B, L_dec) decoder input token indices
-            encoder_out: (B, L_enc, D) encoder output
-            decoder_mask: (B, L_dec) optional padding mask
-            encoder_mask: (B, L_enc) optional encoder padding mask
-
-        Returns:
-            logits: (B, L_dec, vocab_size=2056)
-        """
-        x = self._get_decoder_embedding(decoder_input_ids)
-
-        L_dec = decoder_input_ids.shape[1]
-        cos, sin = self.rope(L_dec, x.device)
-
-        # Compress encoder to bottleneck — prevents position-level copy
-        encoder_compressed = self._compress_encoder(encoder_out)
-
-        for layer in self.decoder_layers:
-            x = layer(x, encoder_compressed, cos, sin, decoder_mask, None)
-
-        x = self.decoder_norm(x)
-        logits = self._get_decoder_logits(x)
-        return logits
 
     def forward(
         self,
